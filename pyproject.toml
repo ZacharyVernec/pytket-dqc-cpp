@@ -1,0 +1,12 @@
+[project]
+name = "pytket-dqc-cpp"
+version = "0.0.2"
+description = "Re-implementation of Pytket-DQC into C++"
+readme = "README.md"
+requires-python = "==3.11.*"
+dependencies = [
+    "pytket-dqc",
+]
+
+[tool.uv.sources]
+pytket-dqc = { git = "https://github.com/CQCL/pytket-dqc.git" }
