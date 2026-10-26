@@ -1,10 +1,12 @@
-Re-implementation of Pytket-DQC in C++ for speed. Mostly vibe-coded with supervision.
+# Pytket_DQC_CPP
+
+Re-implementation of Pytket-DQC in C++ for speed. Mostly vibe-coded with human supervision.
 
 Tested with AI-created tests to ensure method outputs are identical across implementations. Also tested on the QFT with human-created tests relevant to the [distributed QFT](https://github.com/MSRG/dist_qft) project.
 
 The reference implementation is the upstream Python package `pytket_dqc` (Apache-2.0), installed in the project virtualenv at `.venv/lib/python3.11/site-packages/pytket_dqc/`. The C++ port is verified against it; the original Python code is **never modified**.
 
-# Agent design decisions
+# Design decisions (written by AI agent, based on human+agent planning and iteration)
 
 ## Architecture: hybrid (C++ core + Python pytket API)
 
@@ -100,16 +102,16 @@ The reference (`pytket_dqc` + `networkx`) orders sets of `Packet` / `MergedPacke
 
 As a result, when `PYTHONHASHSEED` is set (e.g. `0`, `1`, `42`), the C++ core and the reference produce **identical** results, including which minimum vertex cover is selected and the resulting placement/hypergraph. When `PYTHONHASHSEED` is unset, both the reference and the C++ core draw independent random hash secrets, so their (individually deterministic-per-process) set orderings differ — exactly as two separate runs of the reference would.
 
-## Build & test (instructions for humans)
+# Build & test
 
-### Prerequisites
+## Prerequisites
 
 - CMake >= 3.20 and a C++20 compiler (GCC >= 12 or Clang >= 16).
 - Python 3.11. The project venv at `.venv/` already contains the reference `pytket_dqc` and `networkx` (the oracle).
 - Network access on the **first** configure only (CMake fetches Catch2 and pybind11).
 - For the KaHyPar-backed `HypergraphPartitioning` allocator: the KaHyPar source tree (default `/home/ubuntu/kahypar`) and Boost (`libboost_program_options`). If `DQC_KAHYPAR_SOURCE_DIR` does not contain `lib/libkahypar.cc`, the allocator is skipped (the `_core.hypergraph_partitioning_*` functions and the KaHyPar tests are compiled out).
 
-### 1. Build and run the C++ unit tests
+## 1. Build and run the C++ unit tests
 
 From the repository root:
 
@@ -134,7 +136,7 @@ These are the native Catch2 tests in `cpp/tests/`:
 - `test_hypergraph_partitioning.cpp` — KaHyPar placement validity, capacity, determinism, `can_implement` error (only built when KaHyPar is available).
 - `test_bipartite.cpp`, `test_pyset.cpp`, `test_circuit_analysis.cpp`, `test_placement.cpp`, `test_hypergraph_circuit.cpp` — as before.
 
-### 2. Build the Python bindings
+## 2. Build the Python bindings
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DDQC_BUILD_BINDINGS=ON
@@ -143,7 +145,7 @@ cmake --build build -j
 
 This produces `build/dqc_cpp/_core*.so`, a pybind11 module exposing `PyRandom`, `Hypergraph`, `HypergraphCircuit`, `Graph`, `BipartiteGraph`, `Placement`, `PacMan`, `Distribution`, `GainManager`, `NISQNetwork`, `RepeatRefiner`, `SequenceRefiner`, `steiner_tree`, `direct_from_origin`, `to_euler_with_two_hadamards`, allocators (`Random`, `Ordered`, `Brute`, `Annealing`, `HypergraphPartitioning`) and the refiner functions. The KaHyPar INI is copied next to the module, so the `ini_path` default resolves automatically.
 
-### 3. Confirm Python and C++ behave identically
+## 3. Confirm Python and C++ behave identically
 
 Run the differential checker **with the project venv** (it compares the C++ core against the reference `pytket_dqc` / `networkx` / stdlib `random` in a single process):
 
@@ -174,13 +176,13 @@ Each section prints `OK` and the script exits non-zero on the first mismatch. It
 - `HypergraphPartitioning` vs `pytket_dqc.allocators.HypergraphPartitioning` — **bit-identical placements** (KaHyPar initial partition + `make_valid`) for QFT circuits across partition counts and seeds.
 - `RepeatRefiner` / `SequenceRefiner` — the `_core` classes reproduce the manual do-while / or-fold loops already validated by the other sections.
 
-### What "identical" means here
+## What "identical" means here
 
 - The RNG is **bit-exact**: same doubles, same choices, same randranges.
 - Graph/hypergraph results are **structurally identical**: same nodes, same edges, same hyperedges, in the same order.
 - Set iteration order is **replicated** (CPython `set` layout and SipHash string hashes), so order-sensitive paths — including the vertex-cover refiner's choice of minimum cover — match the reference whenever `PYTHONHASHSEED` is set (the sweep above confirms this for multiple seeds).
 
-### 4. QFT benchmark differential test
+## 4. QFT benchmark differential test
 
 The four benchmark drivers in `tests/python/qft/` run the same QFT workloads through the reference Python package (`main_few_qpus_py.py`, `main_many_qpus_py.py`) and through the C++ core (`main_few_qpus_cpp.py`, `main_many_qpus_cpp.py`). They write their results to `tests/python/qft/results_few_qpus_py/`, `results_few_qpus_cpp/`, `results_many_qpus_py/` and `results_many_qpus_cpp/`; the two `plot_*.py` scripts turn each variant's results into bar charts (pass `--cpp` to plot the C++ variant).
 
