@@ -44,7 +44,7 @@ The reference implementation is the upstream Python package `pytket_dqc` (Apache
 ## Out of scope
 
 - Drawing / visualisation (`draw()`, `draw_nisq_network`, `draw_server_network`; hypernetx, matplotlib, graphviz). Cosmetic only.
-- PyZX equivalence checking (`utils/verification.py`). The `assert check_equivalence(...)` in `Distribution.to_pytket_circuit()` is **not** ported; it does not affect outputs. PyZX remains a Python-side test oracle only.
+- PyZX equivalence checking (`utils/verification.py`). The `assert check_equivalence(...)` in `Distribution.to_pytket_circuit()` is **not** ported; it does not affect outputs. `pytket_dqc_cpp.utils.check_equivalence` / `to_pyzx` delegate to the reference implementation and emit one `UserWarning`; PyZX remains a Python-side test oracle only.
 - Logging / `__str__` output fidelity (only function inputs/outputs matter).
 
 ## Deferred (later phases)
@@ -52,6 +52,95 @@ The reference implementation is the upstream Python package `pytket_dqc` (Apache
 - `RandomHypergraphCircuit` — requires `scipy.stats.unitary_group.rvs(4)` (numpy `RandomState.normal` ziggurat + LAPACK QR). `CyclicHypergraphCircuit` and `RegularGraphHypergraphCircuit` are circuit *generators* that construct a `pytket.Circuit` and apply `DQCPass`; they stay in the Python adapter (their hypergraph construction from the resulting circuit is ported). `RegularGraphHypergraphCircuit` additionally needs `networkx.random_regular_graph`.
 - `Routing` allocator (uses tket `PlacementPass`/`RoutingPass`/`DecomposeSwapsToCXs`) — stays in Python for v1.
 - `numpy.random.RandomState` reproduction — only needed by the deferred pieces above.
+
+All of the deferred pieces above are still available through the Python adapter: the generator classes and the `Routing` allocator delegate to the reference `pytket_dqc` (with a `UserWarning`) instead of using the core.
+
+# Python adapter package: `pytket_dqc_cpp`
+
+The adapter lives in `python/pytket_dqc_cpp/` and mirrors the public Python API of
+`pytket_dqc`: the same module tree (`circuits`, `placement`, `networks`, `packing`,
+`allocators`, `refiners`, `distributors`, `utils`), class names, signatures,
+defaults, attributes, `to_dict`/`from_dict` JSON formats and error messages. All
+subpackages are eagerly imported from the top-level `__init__`, so a single import
+gives you the whole API.
+
+```python
+import pytket_dqc_cpp as pytket_dqc
+from pytket import Circuit
+
+circ = pytket_dqc.DQCPass().apply(Circuit(2).H(0).CU1(0.5, 0, 1))
+network = pytket_dqc.NISQNetwork([[0, 1]], {0: [0], 1: [1]})
+distribution = pytket_dqc.allocators.Random().allocate(circ, network)
+
+pytket_dqc.HypergraphCircuit          # top-level names as upstream
+pytket_dqc.allocators.Random          # subpackages are pre-imported
+pytket_dqc_cpp.circuits.Hyperedge     # full package path also works
+```
+
+There is **no global `pytket_dqc` alias**: the reference package stays installed
+side by side (it is still the oracle, and a runtime dependency for the delegated
+features below). Existing code that imports the reference must change its import
+root, e.g.
+
+```python
+from pytket_dqc.circuits import HypergraphCircuit   # before
+from pytket_dqc_cpp.circuits import HypergraphCircuit  # after
+```
+
+Installing/using it means putting `python/` on `sys.path` (or installing the
+directory); `pytket_dqc_cpp._core` then locates the compiled extension in
+`build/dqc_cpp/` automatically, or raise an `ImportError` quoting the CMake
+command if it has not been built.
+
+## Runtime dependency on the reference package
+
+`pytket-dqc` remains a runtime dependency. It is imported **lazily** (inside the
+delegated functions only, never at module scope) so that plain imports and the
+core-backed code paths do not touch it.
+
+These features are not ported to the C++ core and delegate to `pytket_dqc` at
+call time, emitting **one `UserWarning` per feature per process**:
+
+| Delegated feature | Why |
+| --- | --- |
+| `allocators.Routing` | needs tket `PlacementPass` / `RoutingPass` / `DecomposeSwapsToCXs` |
+| `RandomHypergraphCircuit` | needs `scipy.stats.unitary_group.rvs(4)` |
+| `CyclicHypergraphCircuit` | upstream circuit generator |
+| `RegularGraphHypergraphCircuit` | needs `networkx.random_regular_graph` |
+| `utils.check_equivalence` (`to_pyzx`) | PyZX equivalence checking |
+
+They are correct but slower than the core-backed paths.
+
+## Core-backed vs Python
+
+| Area | Implementation |
+| --- | --- |
+| `HypergraphCircuit` construction, subcircuits, H-embedding queries, `distribution_cost` | C++ core (`_core.HypergraphCircuit`) |
+| `Distribution.cost`, `hyperedge_cost`, `to_pytket_circuit`, validation helpers | C++ core (`_core.Distribution`) |
+| `steiner_tree`, `direct_from_origin`, `to_euler_with_two_hadamards`, `ebit_cost`, `ebit_memory_required`, `all_cu1_local`, `get_server_id`, `is_link_qubit` | C++ core |
+| `PacMan` (packets, neighbouring/hopping/merged, conflict graph) | C++ core (`_core.PacMan`) |
+| `Random`, `Ordered`, `Brute`, `HypergraphPartitioning`, `Annealing.allocate` | C++ core allocators |
+| `EagerHTypeMerge`, `NeighbouringDTypeMerge`, `IntertwinedDTypeMerge`, `BoundaryReallocation` | C++ core refiners |
+| `DetachedGates` | upstream Python `fixed_vertices` + `BoundaryReallocation` (the core entry point segfaults on hyperedges with no gate vertices; see "Known approximations") |
+| `GainManager`, `Annealing` loop, `VertexCover` / `get_min_covers`, `DQCPass`, placement/network/hypergraph data structures | pure Python (hot primitives go to the core) |
+
+`Annealing` is the upstream Python loop on top of the Python `GainManager`. Its
+default initial placement (`Random`) is core-backed and therefore does not
+advance Python's global `random` state; pass `initial_place_method=Ordered()` for
+a trajectory that is byte-for-byte reproducible against the reference.
+
+## Frozen state
+
+After a core refiner call the Python state is synchronised immediately
+(`_bridge.sync_from_core`), so `distribution.circuit.hyperedge_list`,
+`distribution.placement.placement` and the placement key order stay consistent
+with what the core computed.
+
+## Drawing
+
+Drawing is **out of scope**. `draw`, `draw_nisq_network`, `draw_server_network`
+(and the hypernetx / matplotlib / graphviz dependencies) are not implemented, and
+upstream `test_nisq_draw` is not part of the vendored suite.
 
 ## KaHyPar (hypergraph partitioning backend)
 
@@ -192,11 +281,49 @@ The four benchmark drivers in `tests/python/qft/` run the same QFT workloads thr
 
 The checker runs all four drivers under `PYTHONHASHSEED=12345` (override with `QFT_PYTHONHASHSEED`), compares the result files field by field **ignoring the two timing lines**, regenerates the plots for both variants, and exits non-zero if anything differs. Use `--skip-computation` to reuse the existing result files (the plots and the comparison still run), and `--skip-plots` to skip plotting. The generated `.txt`/`.png` files are gitignored.
 
-### 5. (Optional) Upstream pytest suite as an oracle
+### 5. Adapter suite: vendored upstream tests
 
-The unmodified upstream tests live in the `pytket-dqc` repository's `tests/` directory. They can be run against the original package to sanity-check the environment (note: `pytest` is not installed in the venv by default):
+The upstream tests and fixtures from commit `1ac175e` are vendored into `tests/`
+(`tests/*_test.py`, `tests/test_circuits/`) with only the import root rewritten to
+`pytket_dqc_cpp`. Run them **from the repository root** (the fixtures are opened
+through paths relative to the root) with the project venv, which has `pytest`,
+`kahypar`, `pyzx` and the reference package installed:
 
 ```bash
-.venv/bin/python3 -m pip install pytest   # if desired
+PYTHONPATH=python .venv/bin/python -m pytest tests -m "not high_compute"
+PYTHONPATH=python .venv/bin/python -m pytest tests -m high_compute   # slow, optional
+```
+
+`pytest.ini` pins `testpaths = tests`, `python_files = *_test.py test_*.py` (so the
+`tests/python/check_*.py` differential scripts are never collected) and declares the
+`high_compute` marker. `tests/conftest.py` puts `python/` on `sys.path`, so the
+`PYTHONPATH=python` prefix is optional in practice.
+
+Differences from upstream: `test_nisq_draw` is removed (drawing is out of scope)
+and `test_kahypar_install` loads the INI from `pytket_dqc_cpp/allocators/`
+(`importlib_resources` is no longer needed).
+
+### 6. Adapter differential check
+
+`tests/python/check_adapter_equivalence.py` compares `pytket_dqc_cpp` against
+`pytket_dqc` object by object. Run it from the repository root:
+
+```bash
+PYTHONPATH=python .venv/bin/python tests/python/check_adapter_equivalence.py
+```
+
+It covers `HypergraphCircuit` vertices/hyperedges/serialisation, `Distribution.cost`,
+`Random`/`Ordered`/`Brute` placements, seeded `Annealing` (`initial_place_method=Ordered()`),
+refiner booleans + hyperedge lists + placements + costs, `PacMan` packet dictionaries,
+`GainManager` occupancy/cost maps/move gains, `to_pytket_circuit` commands/qubits/params,
+and a lazy-import check for `pytket_dqc`. Like `check_equivalence.py` it re-executes itself
+once per seed in `HASH_SEEDS` (`0, 1, 42, 12345`) when `PYTHONHASHSEED` is unset.
+
+### 7. (Optional) Upstream pytest suite as an oracle
+
+The original, unmodified upstream tests can also be run against the reference
+package to sanity-check the environment:
+
+```bash
 .venv/bin/python3 -m pytest <path-to-upstream-tests> -m "not high_compute"
 ```

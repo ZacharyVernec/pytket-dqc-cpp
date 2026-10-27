@@ -1,0 +1,63 @@
+# Copyright 2023 Quantinuum and The University of Tokyo
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Adapted from `pytket_dqc` (commit 1ac175e) for the `pytket_dqc_cpp` adapter.
+
+from __future__ import annotations
+
+from .._bridge import (
+    core,
+    core_hypergraph_circuit,
+    core_network,
+)
+from ..circuits.distribution import Distribution
+from ..circuits.hypergraph_circuit import HypergraphCircuit
+from ._core_allocation import distribution_from_core
+from .allocator import Allocator
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pytket import Circuit
+    from pytket_dqc_cpp.networks import NISQNetwork
+
+
+class Brute(Allocator):
+    """Brute force allocator which searches through all placements
+    for the best one.
+    """
+
+    def __init__(self) -> None:
+        pass
+
+    def allocate(self, circ: Circuit, network: NISQNetwork, **kwargs) -> Distribution:
+        """Distribute quantum circuit by looking at all possible placements
+        and returning the one with the lowest cost.
+
+        :param circ: Circuit to distribute.
+        :type circ: pytket.Circuit
+        :param network: Network onto which ``circ`` should be distributed.
+        :type network: NISQNetwork
+        :raises Exception: Raised if no valid placement could be found.
+        :return: Distribution of ``circ`` onto ``network``.
+        :rtype: Distribution
+        """
+
+        dist_circ = HypergraphCircuit(circ)
+        if not network.can_implement(dist_circ):
+            raise Exception("This circuit cannot be implemented on this network.")
+
+        core_distribution = core.brute_allocate(
+            core_hypergraph_circuit(dist_circ), core_network(network)
+        )
+        return distribution_from_core(core_distribution, dist_circ, network)

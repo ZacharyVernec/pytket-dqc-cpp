@@ -1,0 +1,763 @@
+# Copyright 2023 Quantinuum and The University of Tokyo
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Adapted from `pytket_dqc` (commit 1ac175e) for the `pytket_dqc_cpp` adapter.
+
+"""Circuit together with the hypergraph that encodes its distribution."""
+
+from __future__ import annotations
+
+from .hypergraph import Hypergraph, Hyperedge, Vertex
+from pytket import OpType, Circuit, Qubit
+from pytket.circuit import Command
+import numpy as np
+from pytket_dqc_cpp.utils import dqc_gateset_predicate
+
+from .._bridge import (
+    commands_from_core,
+    core,
+    core_hypergraph_circuit,
+    qubit_lookup,
+)
+from .._delegation import reference_module, warn_once
+
+from typing import TYPE_CHECKING, Union, Optional, cast
+
+if TYPE_CHECKING:
+    from pytket_dqc_cpp import Placement
+
+
+class HypergraphCircuit(Hypergraph):
+    """Class representing circuit to be distributed on a network.
+    HypergraphCircuit is a child of Hypergraph. HypergraphCircuit adds
+    additional information on top of Hypergraph which describes the
+    correspondence to a circuit.
+
+    :param _circuit: Circuit to be distributed.
+    :type _circuit: Circuit
+    :param _vertex_circuit_map: Map from hypergraph vertices to circuit
+        commands.
+    :type _vertex_circuit_map: dict[int, dict]
+    """
+
+    def __init__(self, circuit: Circuit):
+        """Initialisation function
+
+        :param circuit: Circuit to be distributed.
+        :type circuit: Circuit
+        """
+
+        self.reset(circuit)
+        assert self._vertex_id_predicate()
+        assert self._sorted_hedges_predicate()
+
+    def __str__(self):
+        out_string = super().__str__()
+        out_string += f"\nVertex Circuit Map: {self._vertex_circuit_map}"
+        out_string += "\nCircuit: " + self._circuit.__str__()
+        return out_string
+
+    def __eq__(self, other) -> bool:
+        """Check equality based on equality of components"""
+        if isinstance(other, HypergraphCircuit):
+            return (
+                self._circuit == other._circuit
+                and self._vertex_circuit_map == other._vertex_circuit_map
+                and self._commands == other._commands
+                and super().__eq__(other)
+            )
+        return False
+
+    def to_dict(self) -> dict[str, Union[list[Vertex], list[dict], dict]]:
+        """Generate JSON serialisable dictionary representation of
+        the HypergraphCircuit.
+
+        :return: JSON serialisable dictionary representation of
+            the HypergraphCircuit.
+        :rtype: dict[str, Union[list[Vertex], list[dict], dict]]
+        """
+
+        hypergraph_circuit_dict = super().to_dict()
+        hypergraph_circuit_dict["circuit"] = self._circuit.to_dict()
+        return hypergraph_circuit_dict
+
+    @classmethod
+    def from_dict(
+        cls, hypergraph_circuit_dict: dict[str, Union[list[Vertex], list[dict], dict]]
+    ) -> HypergraphCircuit:
+        """Construct ``HypergraphCircuit`` instance from JSON serialisable
+        dictionary representation of the HypergraphCircuit.
+
+        :param hypergraph_circuit_dict: JSON serialisable dictionary
+            representation of the HypergraphCircuit.
+        :type hypergraph_circuit_dict:
+            dict[str, Union[list[Vertex], list[dict], dict]]
+        :return: HypergraphCircuit instance constructed from
+            hypergraph_circuit_dict.
+        :rtype: HypergraphCircuit
+        """
+
+        hypergraph_circuit = cls(
+            Circuit.from_dict(cast(dict, hypergraph_circuit_dict["circuit"]))
+        )
+        hypergraph_circuit.vertex_list = []
+        hypergraph_circuit.hyperedge_list = []
+        hypergraph_circuit.hyperedge_dict = dict()
+        hypergraph_circuit.vertex_neighbours = dict()
+
+        hypergraph_circuit.add_vertices(
+            cast(list[Vertex], hypergraph_circuit_dict["vertex_list"])
+        )
+        for hyperedge_dict in hypergraph_circuit_dict["hyperedge_list"]:
+            hyperedge = Hyperedge.from_dict(cast(dict, hyperedge_dict))
+            hypergraph_circuit.add_hyperedge(
+                vertices=hyperedge.vertices,
+                weight=hyperedge.weight,
+            )
+        return hypergraph_circuit
+
+    def place(self, placement: Placement):
+        if not self.is_placement(placement):
+            raise Exception("This is not a valid placement of this circuit")
+
+    def reset(self, circuit: Circuit):
+        """Reset object with a new circuit.
+
+        :param circuit: Circuit to reinitialise object with.
+        :type circuit: Circuit
+        """
+
+        super().__init__()
+
+        self._circuit = circuit
+        self._vertex_circuit_map: dict[int, dict] = {}
+        self._commands: list[dict[str, Union[Command, str, int, list[Qubit]]]] = []
+        self.from_circuit()
+
+    def get_circuit(self):
+        return self._circuit.copy()
+
+    def add_hyperedge(
+        self,
+        vertices: list[Vertex],
+        weight: int = 1,
+        hyperedge_list_index: Optional[int] = None,
+        hyperedge_dict_index: Optional[list[int]] = None,
+    ):
+        """Add hyperedge to hypergraph of circuit. Adds some checks on top
+        of add_hypergraph in `Hypergraph` in order to ensure that the
+        first vertex is a qubit, and that there is only one qubit vertex.
+
+        :param vertices: List of vertices in hyperedge to add.
+        :type vertices: list[Vertex]
+        :param weight: Hyperedge weight
+        :type weight: int
+        :param hyperedge_list_index: index in `hyperedge_list` at which the new
+            hyperedge will be added.
+        :type hyperedge_list_index: int
+        :param hyperedge_dict_index: index in `hyperedge_dict` at which the new
+            hyperedge will be added. Note that `hyperedge_dict_index` should
+            be the same length as vertices.
+        :raises Exception: Raised if first vertex in hyperedge is not a qubit
+        :raised Exception: Raised if there is more than one qubit
+            vertex in the list of vertices.
+        """
+
+        if not self.is_qubit_vertex(vertices[0]):
+            raise Exception(
+                f"The first element of {vertices} "
+                + "is required to be a qubit vertex."
+            )
+
+        if any(self.is_qubit_vertex(vertex) for vertex in vertices[1:]):
+            raise Exception("There must be only one qubit in the hyperedge.")
+
+        # I believe this is assumed when distribution costs are calculated.
+        # Please correct me if this is unnecessary.
+        if any(
+            vertex >= next_vertex
+            for vertex, next_vertex in zip(vertices[:-1], vertices[1:])
+        ):
+            raise Exception("Vertex indices must be in increasing order.")
+
+        super(HypergraphCircuit, self).add_hyperedge(
+            vertices=vertices,
+            weight=weight,
+            hyperedge_list_index=hyperedge_list_index,
+            hyperedge_dict_index=hyperedge_dict_index,
+        )
+
+    def merge_hyperedge(self, to_merge_hyperedge_list: list[Hyperedge]) -> Hyperedge:
+        """Wrapper around `Hyperedge.merge_hyperedge` adding some checks.
+        Adds no additional functionality.
+        """
+
+        new_hyperedge = super().merge_hyperedge(
+            to_merge_hyperedge_list=to_merge_hyperedge_list
+        )
+        self._sorted_hedges_predicate()
+
+        return new_hyperedge
+
+    def split_hyperedge(
+        self, old_hyperedge: Hyperedge, new_hyperedge_list: list[Hyperedge]
+    ):
+        """Wrapper around `Hyperedge.split_hyperedge` adding some checks.
+        Adds no additional functionality.
+        """
+
+        super().split_hyperedge(
+            old_hyperedge=old_hyperedge, new_hyperedge_list=new_hyperedge_list
+        )
+
+        self._sorted_hedges_predicate()
+
+    def add_qubit_vertex(self, vertex: Vertex, qubit: Qubit):
+        """Add a vertex to the underlying hypergraph which corresponds to a
+        qubit. Adding vertices in this way allow for the distinction between
+        qubit vertices and gate vertices to be tracked.
+
+        :param vertex: Vertex to be added to hypergraph.
+        :type vertex: int
+        :param qubit: Qubit to which the vertex should correspond
+        :type qubit: Qubit
+        """
+        self.add_vertex(vertex)
+        self._vertex_circuit_map[vertex] = {"type": "qubit", "node": qubit}
+
+    def get_qubit_vertices(self) -> list[Vertex]:
+        """Return list of vertices which correspond to qubits
+
+        :return: list of vertices which correspond to qubits
+        :rtype: List[int]
+        """
+        return [
+            vertex
+            for vertex in self.vertex_list
+            if self._vertex_circuit_map[vertex]["type"] == "qubit"
+        ]
+
+    def add_gate_vertex(self, vertex: Vertex, command: Command):
+        """Add a vertex to the underlying hypergraph which corresponds to a
+        gate. Adding vertices in this way allows for the distinction between
+        qubit and gate vertices to be tracked.
+
+        :param vertex: Vertex to be added to the hypergraph.
+        :type vertex: int
+        :param command: Command to which the vertex corresponds.
+        :type command: Command
+        """
+        self.add_vertex(vertex)
+        self._vertex_circuit_map[vertex] = {"type": "gate", "command": command}
+
+    def is_qubit_vertex(self, vertex: Vertex) -> bool:
+        """Checks if the given vertex corresponds to a qubit.
+
+        :param vertex: Vertex to be checked.
+        :type vertex: int
+        :return: Is it a qubit vertex.
+        :rtype: bool
+        """
+        return self._vertex_circuit_map[vertex]["type"] == "qubit"
+
+    def get_qubit_vertex(self, hyperedge: Hyperedge) -> Vertex:
+        """Returns the qubit vertex in ``hyperedge``."""
+        qubit_list = [
+            vertex for vertex in hyperedge.vertices if self.is_qubit_vertex(vertex)
+        ]
+
+        assert len(qubit_list) == 1
+        return qubit_list[0]
+
+    def get_vertex_of_qubit(self, qubit: Qubit) -> Vertex:
+        """Returns the vertex that corresponds to ``qubit``."""
+        vertex_list = [
+            vertex
+            for vertex in self.vertex_list
+            if self.is_qubit_vertex(vertex)
+            if self._vertex_circuit_map[vertex]["node"] == qubit
+        ]
+
+        assert len(vertex_list) == 1
+        return vertex_list[0]
+
+    def get_gate_vertices(self, hyperedge: Hyperedge) -> list[Vertex]:
+        """Returns the list of gate vertices in ``hyperedge``."""
+        gate_vertex_list = [
+            vertex
+            for vertex in hyperedge.vertices
+            if self._vertex_circuit_map[vertex]["type"] == "gate"
+        ]
+
+        assert len(gate_vertex_list) == len(hyperedge.vertices) - 1
+        return gate_vertex_list
+
+    def get_qubit_of_vertex(self, vertex: Vertex) -> Qubit:
+        """Returns the qubit the hypergraph's vertex corresponds to.
+        If the vertex is not a qubit vertex, an exception is raised.
+        """
+        if self._vertex_circuit_map[vertex]["type"] != "qubit":
+            raise Exception("Not a qubit vertex!")
+        return self._vertex_circuit_map[vertex]["node"]
+
+    def get_gate_of_vertex(self, vertex: Vertex) -> Command:
+        """Returns the gate the hypergraph's vertex corresponds to.
+        If the vertex is not a gate vertex, an exception is raised.
+        """
+        if self._vertex_circuit_map[vertex]["type"] != "gate":
+            raise Exception("Not a gate vertex!")
+        return self._vertex_circuit_map[vertex]["command"]
+
+    def get_hyperedges_containing(self, vertices: list[Vertex]) -> list[Hyperedge]:
+        """Returns the list of hyperedges that contain ``vertices`` as
+        a subset of their own vertices.
+        """
+        return [
+            hedge
+            for hedge in self.hyperedge_list
+            if all(v in hedge.vertices for v in vertices)
+        ]
+
+    def get_hyperedge_subcircuit(self, hyperedge: Hyperedge) -> list[Command]:
+        """Returns the list of commands between the first and last gate within
+        the hyperedge. Commands that don't act on the qubit vertex are omitted
+        but embedded gates within the hyperedge are included.
+
+        NOTE: The single qubit gates on the hyperedge's qubit are replaced by
+        their Euler decomposition using ``to_euler_with_two_hadamards`` when
+        necessary to satisfy the embedding requirements.
+        NOTE: Rz gates at either side of an H-embedded CU1 gate are squashed
+        together. The resulting phase must be an integer.
+        """
+        rows = core_hypergraph_circuit(self).get_hyperedge_subcircuit(
+            [int(v) for v in hyperedge.vertices], int(hyperedge.weight)
+        )
+        return commands_from_core(rows, qubit_lookup(self._circuit))
+
+    def requires_h_embedded_cu1(self, hyperedge: Hyperedge) -> bool:
+        """Returns whether or not H-type embedding of CU1 gates is required
+        to implement the given hyperedge.
+        """
+        return bool(
+            core_hypergraph_circuit(self).requires_h_embedded_cu1(
+                [int(v) for v in hyperedge.vertices], int(hyperedge.weight)
+            )
+        )
+
+    def get_h_embedded_gate_vertices(self, hyperedge: Hyperedge) -> list[Vertex]:
+        """Returns the list of gate vertices that are embedded on the
+        given hyperedge.
+        """
+        subcircuit = self.get_hyperedge_subcircuit(hyperedge)
+        gate_vertices_in_subcircuit = []
+        h_embedded_gate_vertices = []
+
+        # Find out all of the gate vertices in `subcircuit`. Unfortunately,
+        # this can't be done by exploring `subcircuit`, since it removed
+        # many CU1 gates. Instead, we use the information in `hyperedge`
+        v_g = min(self.get_gate_vertices(hyperedge))
+        q = self.get_qubit_of_vertex(self.get_qubit_vertex(hyperedge))
+        while v_g <= max(self.get_gate_vertices(hyperedge)):
+            if q in self.get_gate_of_vertex(v_g).qubits:
+                gate_vertices_in_subcircuit.append(v_g)
+            v_g += 1
+
+        # Go through the `subcircuit` and the list of gate vertices in it,
+        # identifying the gates that are embedded.
+        currently_embedding = False
+        for cmd in subcircuit:
+            if cmd.op.type == OpType.H:
+                currently_embedding = not currently_embedding
+            elif cmd.op.type == OpType.CU1:
+                v_g = gate_vertices_in_subcircuit.pop(0)
+
+                if currently_embedding:
+                    h_embedded_gate_vertices.append(v_g)
+
+        # Sanity check: the list of gate vertices has been exhausted
+        assert not gate_vertices_in_subcircuit
+        return h_embedded_gate_vertices
+
+    def get_all_h_embedded_gate_vertices(self) -> list[Vertex]:
+        """Returns the list of gate vertices that are embedded on any
+        hyperedge.
+        """
+        h_embedded_gate_vertices = set()
+
+        for hedge in self.hyperedge_list:
+            vertex_list = self.get_h_embedded_gate_vertices(hedge)
+            h_embedded_gate_vertices.update(vertex_list)
+
+        return list(h_embedded_gate_vertices)
+
+    def from_circuit(self):
+        """Method to create a hypergraph from a circuit.
+
+        :raises Exception: Raised if the circuit whose hypergraph is to be
+        created is not in the valid gate set.
+        """
+
+        if not dqc_gateset_predicate.verify(self._circuit):
+            raise Exception(
+                "The inputted circuit is not in a valid gateset. "
+                + "You can apply ``DQCPass`` from pytket_dqc.utils "
+                + "on the circuit to rebase it to a valid gateset."
+            )
+
+        two_q_gate_count = 0
+        # For each command in the circuit, add the command to a list.
+        # If the command is a two-qubit gate, store n, where the
+        # command is the nth 2 qubit gate in the circuit.
+        for command in self._circuit.get_commands():
+            if command.op.type in [OpType.CZ, OpType.CU1, OpType.CX]:
+                self._commands.append(
+                    {"command": command, "two q gate count": two_q_gate_count}
+                )
+                two_q_gate_count += 1
+            else:
+                self._commands.append({"command": command})
+
+        # Construct the hypergraph corresponding to this circuit.
+        # For each qubit, add commands acting on the qubit in an uninterrupted
+        # sequence (i.e. not separated by single qubit gates) to the
+        # same hyperedge, along with the qubit. If the gate is a CX,
+        # add the gate vertex when the control is intercepted, and add a new
+        # weight 2 hyper edge if the control is intercepted. The weight 2
+        # hyperedge corresponds to performing a possible teleportation.
+        for qubit_index, qubit in enumerate(self._circuit.qubits):
+            self.add_qubit_vertex(qubit_index, qubit)
+
+            hyperedge = [qubit_index]
+            # Gather all of the commands acting on qubit.
+            qubit_commands = [
+                {"command_index": command_index, "command": command}
+                for command_index, command in enumerate(self._commands)
+                if qubit in command["command"].qubits
+            ]
+
+            # This tracks if any two qubit gates have been found on the qubit
+            # wire. If not, a one element hyperedge containing just the
+            # qubit vertex is added.
+            two_qubit_gate_found = False
+
+            for command_dict in qubit_commands:
+                command = command_dict["command"]
+                command_index = command_dict["command_index"]
+                # If the command is a CZ gate add it to the current working
+                # hyperedge.
+                if command["command"].op.type in [OpType.CZ, OpType.CU1]:
+                    two_qubit_gate_found = True
+                    vertex = command["two q gate count"] + self._circuit.n_qubits
+                    self.add_gate_vertex(vertex, command["command"])
+                    hyperedge.append(vertex)
+                    self._commands[command_index]["vertex"] = vertex
+                    self._commands[command_index]["type"] = "distributed gate"
+                # If the command is a CX, add it to the current
+                # working hyperedge, if the working qubit is the control.
+                # Otherwise start a fresh weight 2 hyper edge, add the two
+                # vertex hyperedge consisting of the gate and the qubit, and
+                # start a fresh hyper edge again.
+                # TODO: Note that this method of adding a CX is very
+                # lazy. Indeed, in the case where a teleportation is required,
+                # a new hyper edge need not be started, as other gates which
+                # follow may also benefit from the teleportation.
+                elif command["command"].op.type in [OpType.CX]:
+                    two_qubit_gate_found = True
+                    # Check if working qubit is the control
+                    if qubit == command["command"].qubits[0]:
+                        vertex = command["two q gate count"] + self._circuit.n_qubits
+                        self.add_gate_vertex(vertex, command["command"])
+                        hyperedge.append(vertex)
+                    else:
+                        # Add current working hyperedge.
+                        if len(hyperedge) > 1:
+                            self.add_hyperedge(hyperedge)
+                        # Add two vertex weight 2 hyperedge
+                        vertex = command["two q gate count"] + self._circuit.n_qubits
+                        self.add_gate_vertex(vertex, command["command"])
+                        hyperedge = [qubit_index, vertex]
+                        self.add_hyperedge(hyperedge, weight=2)
+                        # Start a fresh hyperedge
+                        hyperedge = [qubit_index]
+                    self._commands[command_index]["vertex"] = vertex
+                    self._commands[command_index]["type"] = "distributed gate"
+                # Encountering a Rz does not affect the hypergraph.
+                elif command["command"].op.type in [OpType.Rz]:
+                    self._commands[command_index]["type"] = "1q local gate"
+                # Otherwise (which is to say if a H gate is
+                # encountered) add the hyperedge to the hypergraph and start
+                # a new working hyperedge.
+                else:
+                    if len(hyperedge) > 1:
+                        self.add_hyperedge(hyperedge)
+                        hyperedge = [qubit_index]
+                    self._commands[command_index]["type"] = "1q local gate"
+
+            # If there is an hyperedge that has not been added once all
+            # commands have bee iterated through, add it now.
+            if len(hyperedge) > 1 or not two_qubit_gate_found:
+                self.add_hyperedge(hyperedge)
+
+        # TODO: Currently we are not supporting teleportation within our
+        # distributors, so we assert that all hyperedges have weight one.
+        # This should be guaranteed due to `dqc_gateset` only containing
+        # gates that may be implemented via EJPP packing.
+        assert self.weight_one_predicate()
+
+    def _vertex_id_predicate(self) -> bool:
+        """Tests that the vertices in the hypergraph are numbered with all
+        qubit vertices first and then the gate vertices in the same order
+        of occurrence in the circuit. Should be guaranteed by construction.
+        """
+        vertices = sorted(self.vertex_list)
+        qubit_vertices = sorted(self.get_qubit_vertices())
+
+        for q in qubit_vertices:
+            # If there are no vertices left or the next one is not a qubit,
+            # the predicate is unsatisfied
+            if not vertices or vertices.pop(0) != q:
+                return False
+
+        for cmd in self._circuit.get_commands():
+            if cmd.op.type in [OpType.CU1, OpType.CZ, OpType.CX]:
+                # If all vertices have been popped, unsatisfied
+                if not vertices:
+                    return False
+                # Pop the next vertex and check commands match
+                gate_vertex = vertices.pop(0)
+                if self._vertex_circuit_map[gate_vertex]["command"] != cmd:
+                    return False
+
+        # There should be no more vertices left
+        return not vertices
+
+    def _sorted_hedges_predicate(self) -> bool:
+        """Tests that the hyperedges are in circuit sequential order
+        in `self.hyperedge_list`.
+        """
+
+        for qubit_vertex in self.get_qubit_vertices():
+            hedge_list = [
+                hedge
+                for hedge in self.hyperedge_list
+                if self.get_qubit_vertex(hedge) == qubit_vertex
+            ]
+            if len(hedge_list) <= 1:
+                continue
+            if hedge_list != sorted(
+                hedge_list,
+                key=lambda hedge: min([v for v in hedge.vertices if v != qubit_vertex]),
+            ):
+                return False
+
+        return True
+
+    def _get_server_to_qubit_vertex(
+        self, placement: Placement
+    ) -> dict[int, list[Vertex]]:
+        """Return dictionary mapping servers to a list of the qubit
+        vertices which it contains.
+
+        :param placement: Placement of hypergraph vertices onto servers.
+        :type placement: Placement
+        :raises Exception: Raised if the placement is not valid.
+        :return: Dictionary mapping servers to a list of the qubit
+        vertices which it contains.
+        :rtype: dict[int, list[Vertex]]
+        """
+
+        # Initial check that placement is valid
+        if not self.is_placement(placement):
+            raise Exception("This is not a valid placement for this circuit.")
+
+        # A dictionary mapping servers to the qubit vertices it contains
+        return {
+            server: [
+                vertex
+                for vertex in self.get_qubit_vertices()
+                if placement.placement[vertex] == server
+            ]
+            for server in set(placement.placement.values())
+        }
+
+    def get_vertex_to_command_index_map(self) -> dict[Vertex, int]:
+        """Get a mapping from each gate `Vertex` in the `Hypergraph`, to its
+        corresponding index in the list returned by `Circuit.get_commands()`.
+        """
+
+        vertex_to_command_index_map: dict[Vertex, int] = dict()
+        for command_index, command_dict in enumerate(self._commands):
+            if command_dict["type"] == "distributed gate":
+                vertex = command_dict["vertex"]
+                assert type(vertex) is Vertex
+                vertex_to_command_index_map[vertex] = command_index
+        return vertex_to_command_index_map
+
+    def get_last_gate_vertex(self, gate_vertex_list: list[Vertex]) -> Vertex:
+        """Given a list of gate vertices,
+        return the vertex in `Circuit.get_commands()`
+        that corresponds to the last gate in the circuit.
+        """
+
+        return max(gate_vertex_list)
+
+    def get_first_gate_vertex(self, gate_vertex_list: list[Vertex]) -> Vertex:
+        """Given a list of gate vertices,
+        return the vertex in `Circuit.get_commands()`
+        that corresponds to the first gate in the circuit.
+        """
+
+        assert all([v >= len(self.get_qubit_vertices()) for v in gate_vertex_list])
+
+        return min(gate_vertex_list)
+
+    def get_intermediate_commands(
+        self, first_vertex: Vertex, second_vertex: Vertex, qubit_vertex: Vertex
+    ) -> list[Command]:
+        """Given two gate vertices and a qubit vertex, return all commands
+        in the circuit after the gate corresponding to ``first_vertex`` and up
+        until the gate corresponding to ``second_vertex``.
+
+        NOTE: the ``first_vertex`` and ``second_vertex`` gates aren't included
+        NOTE: only the commands acting on ``qubit_vertex`` are included.
+        """
+
+        assert self.is_qubit_vertex(qubit_vertex)
+        assert first_vertex in self.vertex_list and not self.is_qubit_vertex(
+            first_vertex
+        )
+        assert second_vertex in self.vertex_list and not self.is_qubit_vertex(
+            second_vertex
+        )
+
+        qubit = self.get_qubit_of_vertex(qubit_vertex)
+
+        vertex_to_command_index_map = self.get_vertex_to_command_index_map()
+        first_command_index = vertex_to_command_index_map[first_vertex]
+        second_command_index = vertex_to_command_index_map[second_vertex]
+
+        intermediate_commands: list[Command] = []
+
+        for command_dict in self._commands[
+            first_command_index
+            + 1 : second_command_index  # noqa: E203
+        ]:
+            command = command_dict["command"]
+            assert type(command) is Command
+            if qubit in command.qubits:
+                intermediate_commands.append(cast(Command, command_dict["command"]))
+
+        return intermediate_commands
+
+    def is_h_embeddable_CU1(
+        self, command: Command, servers: set[int], placement: Placement
+    ) -> bool:
+        """Check that a CU1 could be embeddable in a H embedding unit.
+
+        A return value of ``False`` only proves it cannot be embedded.
+        Since we do not check the 1q gates surrounding it,
+        a return value of ``True`` does not guarantee it is embeddable in
+        a H embedding unit.
+        """
+        assert command.op.type == OpType.CU1
+
+        this_command_qubit_vertices = [
+            self.get_vertex_of_qubit(qubit) for qubit in command.qubits
+        ]
+
+        this_command_servers = {
+            placement.placement[qubit_vertex]
+            for qubit_vertex in this_command_qubit_vertices
+        }
+
+        if servers != this_command_servers:
+            return False
+
+        return bool(np.isclose(command.op.params[0] % 1, 0)) or bool(
+            np.isclose(command.op.params[0] % 1, 1)
+        )
+
+
+class RandomHypergraphCircuit(HypergraphCircuit):
+    """Generates circuit to be distributed, where the circuit is a random
+    circuit of the form used in quantum volume experiments.
+    """
+
+    def __init__(self, n_qubits: int, n_layers: int):
+        """Initialisation function.
+
+        :param n_qubits: The number of qubits the circuit covers.
+        :type n_qubits: int
+        :param n_layers: The number of layers of random 2-qubit gates.
+        :type n_layers: int
+        """
+
+        warn_once("RandomHypergraphCircuit")
+        reference = reference_module("circuits.hypergraph_circuit")
+        circuit = reference.RandomHypergraphCircuit(n_qubits, n_layers).get_circuit()
+        super().__init__(circuit)
+
+
+class CyclicHypergraphCircuit(HypergraphCircuit):
+    """Particular instance of the HypergraphCircuit class, where the circuit
+    is constructed from CZ gates acting in a loop accross all qubits.
+    """
+
+    def __init__(self, n_qubits: int, n_layers: int):
+        """Initialisation function.
+
+        :param n_qubits: The number of qubits the circuit covers.
+        :type n_qubits: int
+        :param n_layers: The number of layers of loops of CZ gates.
+        :type n_layers: int
+        """
+
+        warn_once("CyclicHypergraphCircuit")
+        reference = reference_module("circuits.hypergraph_circuit")
+        circuit = reference.CyclicHypergraphCircuit(n_qubits, n_layers).get_circuit()
+        super().__init__(circuit)
+
+
+class RegularGraphHypergraphCircuit(HypergraphCircuit):
+    """HypergraphCircuit constructed by acting CZ gates between qubits which
+    neighbour each other in a random regular graph.
+    """
+
+    def __init__(
+        self,
+        n_qubits: int,
+        degree: int,
+        n_layers: int,
+        **kwargs,
+    ):
+        """Initialisation function
+
+        :param n_qubits: The number of qubits on which the circuit acts.
+        :type n_qubits: int
+        :param degree: The degree of the random regular graph.
+        :type degree: int
+        :param n_layers: The number of random regular graphs to generate.
+        :type n_layers: int
+
+        :key seed: Seed for the random generation of regular graphs,
+            defaults to None
+        :type seed: int, optional
+        """
+
+        warn_once("RegularGraphHypergraphCircuit")
+        reference = reference_module("circuits.hypergraph_circuit")
+        circuit = reference.RegularGraphHypergraphCircuit(
+            n_qubits, degree, n_layers, **kwargs
+        ).get_circuit()
+        super().__init__(circuit)
