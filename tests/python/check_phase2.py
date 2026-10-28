@@ -519,14 +519,19 @@ def check_constraint_and_update():
             ),
             str(adapter_error),
         )
-        # Known core divergence: the trailing "to_pytket_circuit(allow_update=
-        # True)" hint and ``v_gate`` are not carried across pybind11 (the core
-        # raises a plain RuntimeError, so only the message prefix survives).
+        # ConstraintException attribute parity: pybind11 translates
+        # dqc::ConstraintException with .server, .v_gate, and the
+        # "to_pytket_circuit(allow_update=True)" hint preserved.
+        check(
+            "constraint: adapter hint",
+            "to_pytket_circuit(allow_update=True)" in str(adapter_error),
+        )
         check(
             "constraint: reference hint",
             "to_pytket_circuit(allow_update=True)" in str(ref_error),
         )
         check("constraint: server", ref_error.server == adapter_error.server)
+        check("constraint: v_gate", ref_error.v_gate == adapter_error.v_gate)
 
     # allow_update=True must split hyperedges identically on both sides.
     ref_updated = reference_dist.to_pytket_circuit(allow_update=True)

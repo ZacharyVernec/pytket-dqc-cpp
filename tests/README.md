@@ -21,13 +21,40 @@ They are the interface acceptance gate for the `pytket_dqc_cpp` adapter.
   repository root.
 - `conftest.py` is adapter-only (adds `python/` to `sys.path`); there is no
   `tests/__init__.py` (rootdir-relative import mode is enough).
+- `rng_semantics_test.py` and `error_parity_test.py` are adapter-specific test suites
+  covering RNG reproducibility semantics and strict `ConstraintException` API parity
+  against the upstream reference.
+
+## Upstream Skips in Vendored Suite
+
+When running `pytest tests -m "not high_compute"`, 7 tests are skipped upstream.
+These are identical to the skips present in the upstream `pytket-dqc@1ac175e` repository:
+
+1. `tests/allocator_test.py:152` (`test_refinement_makes_valid`): "Circuit contains CX gates that are not supported."
+2. `tests/allocator_test.py:373` (`test_q_control_box_circuits`): "QControlBox are not supported for now"
+3. `tests/circuits_test.py:439` (`test_q_control_box_circuits`): "QControlBox are not supported for now"
+4. `tests/circuits_test.py:1693` (`test_to_pytket_circuit_with_teleportation`): "Support for teleportation has been disabled"
+5. `tests/circuits_test.py:1791` (`test_to_relabeled_registers`): "Tests a function that has been removed"
+6. `tests/network_test.py:122` (`test_nisq_get_placer`): "This test needs to be fixed."
+7. `tests/utils_test.py:56` (`test_CX_circuit`): "Support for CX gates temporarily disabled"
 
 ## Commands
+
+Run the full unified verification gate runner:
+
+```bash
+./tests/python/run_gates.sh
+```
+
+Or run individual tiers:
 
 ```bash
 PYTHONPATH=python .venv/bin/python -m pytest tests -m "not high_compute"
 PYTHONPATH=python .venv/bin/python -m pytest tests -m high_compute        # slow, optional
-PYTHONPATH=python .venv/bin/python tests/python/check_adapter_equivalence.py
+PYTHONPATH=python .venv/bin/python tests/python/check_equivalence.py       # Core differential
+PYTHONPATH=python .venv/bin/python tests/python/check_adapter_equivalence.py # Adapter differential
+.venv/bin/python3 tests/python/check_qft_equivalence.py                    # QFT benchmark differential
+ctest --test-dir build --output-on-failure                                 # C++ Catch2 suite
 ```
 
 `tests/python/check_*.py` are differential scripts, not pytest modules

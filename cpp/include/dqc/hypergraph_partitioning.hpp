@@ -92,7 +92,7 @@ inline Placement hypergraph_partitioning_initial_placement(
     const std::vector<std::pair<int, int>>& server_coupling,
     const std::vector<std::pair<int, std::vector<int>>>& server_qubits,
     const std::string& ini_path,
-    std::optional<std::uint64_t> seed) {
+    std::optional<std::int64_t> seed) {
   if (!dist_circ.is_valid()) {
     throw std::runtime_error("This hypergraph is not valid.");
   }
@@ -226,7 +226,7 @@ inline Distribution hypergraph_partitioning_allocate(
     const std::vector<std::pair<int, int>>& server_coupling,
     const std::vector<std::pair<int, std::vector<int>>>& server_qubits,
     const Graph& server_graph, const std::map<int, int>& server_ebit_mem,
-    const std::string& ini_path, std::optional<std::uint64_t> seed) {
+    const std::string& ini_path, std::optional<std::int64_t> seed) {
   check_can_implement(dist_circ, server_qubits);
 
   Placement placement = hypergraph_partitioning_initial_placement(

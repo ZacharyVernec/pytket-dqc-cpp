@@ -205,7 +205,7 @@ PYBIND11_MODULE(_core, m) {
 
   // ---- PyRandom ----------------------------------------------------------
   py::class_<PyRandom>(m, "PyRandom")
-      .def(py::init<std::optional<std::uint64_t>>(), py::arg("seed") = 0)
+      .def(py::init<std::optional<std::uint64_t>>(), py::arg("seed") = std::nullopt)
       .def("seed", &PyRandom::seed, py::arg("a"))
       .def("random", &PyRandom::random)
       .def("uniform", &PyRandom::uniform, py::arg("a"), py::arg("b"))
@@ -218,7 +218,9 @@ PYBIND11_MODULE(_core, m) {
       .def("choice",
            [](PyRandom& r, const std::vector<int>& seq) { return r.choice(seq); },
            py::arg("seq"))
-      .def("getrandbits", &PyRandom::getrandbits, py::arg("k"));
+      .def("getrandbits", &PyRandom::getrandbits, py::arg("k"))
+      .def("get_state", &PyRandom::get_state)
+      .def("set_state", &PyRandom::set_state, py::arg("state"));
 
   // ---- Hyperedge / Hypergraph / Placement ---------------------------------
   py::class_<Hyperedge>(m, "Hyperedge")
@@ -810,8 +812,20 @@ PYBIND11_MODULE(_core, m) {
       .def("to_pytket_circuit",
            [](std::shared_ptr<Distribution> d, bool satisfy_bound,
               bool allow_update) {
-             ToPytketCircuitResult res =
-                 to_pytket_circuit(*d, satisfy_bound, allow_update);
+             ToPytketCircuitResult res;
+             try {
+               res = to_pytket_circuit(*d, satisfy_bound, allow_update);
+             } catch (const ConstraintException& e) {
+               py::object mod =
+                   py::module_::import("pytket_dqc_cpp.utils.circuit_analysis");
+               py::object py_exc_cls = mod.attr("ConstraintException");
+               py::object py_exc = py_exc_cls(e.what(), e.server);
+               if (e.v_gate >= 0) {
+                 py_exc.attr("v_gate") = e.v_gate;
+               }
+               py::set_error(py_exc_cls, py_exc);
+               throw py::error_already_set();
+             }
              if (res.cost_mismatch_detached_embedded) {
                const std::string msg =
                    "Detected a gate that is both detached and embedded. As a "
@@ -868,6 +882,36 @@ PYBIND11_MODULE(_core, m) {
         py::arg("stop_parameter") = 0.05, py::arg("seed") = std::nullopt,
         py::arg("cache_limit") = std::nullopt);
 
+  m.def("boundary_reallocation_refine_with_state",
+        [](std::shared_ptr<Distribution> d,
+           const std::vector<Vertex>& fixed_vertices, int num_rounds,
+           double stop_parameter, std::optional<std::uint64_t> seed,
+           std::optional<int> cache_limit,
+           const std::optional<std::vector<std::uint32_t>>& rng_state) {
+          return boundary_reallocation_refine_with_state(
+              *d, fixed_vertices, num_rounds, stop_parameter, seed, cache_limit,
+              rng_state);
+        },
+        py::arg("distribution"),
+        py::arg("fixed_vertices") = std::vector<Vertex>{},
+        py::arg("num_rounds") = 10, py::arg("stop_parameter") = 0.05,
+        py::arg("seed") = std::nullopt,
+        py::arg("cache_limit") = std::nullopt,
+        py::arg("rng_state") = std::nullopt);
+
+  m.def("detached_gates_refine_with_state",
+        [](std::shared_ptr<Distribution> d, int num_rounds,
+           double stop_parameter, std::optional<std::uint64_t> seed,
+           std::optional<int> cache_limit,
+           const std::optional<std::vector<std::uint32_t>>& rng_state) {
+          return detached_gates_refine_with_state(
+              *d, num_rounds, stop_parameter, seed, cache_limit, rng_state);
+        },
+        py::arg("distribution"), py::arg("num_rounds") = 10,
+        py::arg("stop_parameter") = 0.05, py::arg("seed") = std::nullopt,
+        py::arg("cache_limit") = std::nullopt,
+        py::arg("rng_state") = std::nullopt);
+
   py::class_<GainManager>(m, "GainManager")
       .def(py::init(
                [](std::shared_ptr<Distribution> d, int max_key_size) {
@@ -911,6 +955,17 @@ PYBIND11_MODULE(_core, m) {
                                  network.server_ebit_mem(), seed);
         },
         py::arg("circuit"), py::arg("network"), py::arg("seed") = std::nullopt);
+  m.def("random_allocate_with_state",
+        [](const HypergraphCircuit& h, const NISQNetwork& network,
+           std::optional<std::uint64_t> seed,
+           const std::optional<std::vector<std::uint32_t>>& rng_state) {
+          return random_allocate_with_state(
+              h, network.server_coupling(), network.server_qubits(),
+              network.get_server_nx(), network.server_ebit_mem(), seed,
+              rng_state);
+        },
+        py::arg("circuit"), py::arg("network"), py::arg("seed") = std::nullopt,
+        py::arg("rng_state") = std::nullopt);
   m.def("ordered_allocate",
         [](const HypergraphCircuit& h, const NISQNetwork& network) {
           return ordered_allocate(h, network.server_qubits(),
@@ -947,12 +1002,62 @@ PYBIND11_MODULE(_core, m) {
         py::arg("seed") = std::nullopt,
         py::arg("initial_place_seed") = std::nullopt);
 
+  m.def("annealing_from_placement",
+        [](const HypergraphCircuit& h, const Placement& p,
+           const NISQNetwork& network, int iterations,
+           double initial_temperature, std::optional<int> cache_limit,
+           std::optional<std::uint64_t> seed,
+           const std::optional<std::vector<std::uint32_t>>& rng_state) {
+          return annealing_from_placement(
+              h, p, network.server_coupling(), network.server_qubits(),
+              network.get_server_nx(), network.server_ebit_mem(), iterations,
+              initial_temperature, cache_limit, seed, rng_state);
+        },
+        py::arg("circuit"), py::arg("placement"), py::arg("network"),
+        py::arg("iterations") = 30000, py::arg("initial_temperature") = 3.0,
+        py::arg("cache_limit") = std::nullopt,
+        py::arg("seed") = std::nullopt,
+        py::arg("rng_state") = std::nullopt);
+
+  m.def("annealing_from_placement_with_state",
+        [](const HypergraphCircuit& h, const Placement& p,
+           const NISQNetwork& network, int iterations,
+           double initial_temperature, std::optional<int> cache_limit,
+           std::optional<std::uint64_t> seed,
+           const std::optional<std::vector<std::uint32_t>>& rng_state) {
+          return annealing_from_placement_with_state(
+              h, p, network.server_coupling(), network.server_qubits(),
+              network.get_server_nx(), network.server_ebit_mem(), iterations,
+              initial_temperature, cache_limit, seed, rng_state);
+        },
+        py::arg("circuit"), py::arg("placement"), py::arg("network"),
+        py::arg("iterations") = 30000, py::arg("initial_temperature") = 3.0,
+        py::arg("cache_limit") = std::nullopt,
+        py::arg("seed") = std::nullopt,
+        py::arg("rng_state") = std::nullopt);
+
+  m.def("annealing_allocate_with_state",
+        [](const HypergraphCircuit& h, const NISQNetwork& network,
+           int iterations, double initial_temperature,
+           std::optional<int> cache_limit, std::optional<std::uint64_t> seed,
+           std::optional<std::uint64_t> initial_place_seed) {
+          return annealing_allocate_with_state(
+              h, network.server_coupling(), network.server_qubits(),
+              network.get_server_nx(), network.server_ebit_mem(), iterations,
+              initial_temperature, cache_limit, seed, initial_place_seed);
+        },
+        py::arg("circuit"), py::arg("network"),
+        py::arg("iterations") = 30000, py::arg("initial_temperature") = 3.0,
+        py::arg("cache_limit") = std::nullopt,
+        py::arg("seed") = std::nullopt,
+        py::arg("initial_place_seed") = std::nullopt);
+
   // ---- HypergraphPartitioning (KaHyPar) ------------------------------------
 #ifdef DQC_HAS_KAHYPAR
   m.def("hypergraph_partitioning_allocate",
         [](const HypergraphCircuit& h, const NISQNetwork& network,
            std::optional<std::string> ini_path,
-           std::optional<std::uint64_t> seed) {
+           std::optional<std::int64_t> seed) {
           const std::string path =
               ini_path.has_value() ? *ini_path : default_ini_path();
           return hypergraph_partitioning_allocate(
@@ -964,7 +1069,7 @@ PYBIND11_MODULE(_core, m) {
   m.def("hypergraph_partitioning_initial_placement",
         [](const HypergraphCircuit& h, const NISQNetwork& network,
            std::optional<std::string> ini_path,
-           std::optional<std::uint64_t> seed) {
+           std::optional<std::int64_t> seed) {
           const std::string path =
               ini_path.has_value() ? *ini_path : default_ini_path();
           return hypergraph_partitioning_initial_placement(

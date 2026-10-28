@@ -18,7 +18,13 @@ from __future__ import annotations
 
 import math
 
-from .._bridge import core, core_distribution, sync_from_core
+from .._bridge import (
+    call_with_python_rng,
+    core,
+    core_distribution,
+    normalize_seed,
+    sync_from_core,
+)
 from ..circuits.distribution import Distribution
 from .refiner import Refiner
 
@@ -59,7 +65,11 @@ class BoundaryReallocation(Refiner):
         :key stop_parameter: Real number in [0,1]. If proportion of moves
             in a round is smaller than this number, do no more rounds. Default
             is 0.05.
-        :key seed: Seed for randomness. Default is None.
+        :key seed: Seed for randomness. Default is None: unseeded calls
+            continue Python's ambient ``random`` stream and return the advanced
+            state to it, exactly as upstream ``pytket_dqc`` does. For
+            reproducible results or cross-library parity, specify an explicit
+            integer seed.
         :key cache_limit: The maximum size of the set of servers whose cost is
             stored in cache. Default value is 5.
 
@@ -70,12 +80,15 @@ class BoundaryReallocation(Refiner):
         fixed_vertices = kwargs.get("fixed_vertices", [])
         num_rounds = kwargs.get("num_rounds", 10)
         stop_parameter = kwargs.get("stop_parameter", 0.05)
-        seed = kwargs.get("seed", None)
+        # The core binding takes an unsigned integer; CPython's random.seed
+        # uses abs(seed), including for negative integers.
+        seed = normalize_seed(kwargs.get("seed", None))
         cache_limit = kwargs.get("cache_limit", None)
 
         core_dist = core_distribution(distribution)
         refinement_made = bool(
-            core.boundary_reallocation_refine(
+            call_with_python_rng(
+                core.boundary_reallocation_refine_with_state,
                 core_dist,
                 [int(vertex) for vertex in fixed_vertices],
                 # The reference loops ``while round_id < num_rounds``, so a
@@ -85,6 +98,10 @@ class BoundaryReallocation(Refiner):
                 stop_parameter,
                 seed,
                 cache_limit,
+                seed=seed,
+                # The reference only reseeds when an explicit seed is given;
+                # otherwise it continues the ambient stream.
+                reseed=seed is not None,
             )
         )
         sync_from_core(distribution, core_dist)

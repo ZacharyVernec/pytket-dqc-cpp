@@ -16,47 +16,27 @@
 
 from __future__ import annotations
 
-import math
 import random
 
+from .._bridge import (
+    call_with_python_rng,
+    core,
+    core_hypergraph_circuit,
+    core_network,
+    core_placement,
+    normalize_seed,
+)
+from .._delegation import warn_once
 from ..circuits.distribution import Distribution
 from ..circuits.hypergraph_circuit import HypergraphCircuit
+from ._core_allocation import distribution_from_core
 from .allocator import Allocator
-from .gain_manager import GainManager
 from .random import Random
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from pytket import Circuit
     from pytket_dqc_cpp.networks import NISQNetwork
-
-
-# Credit to
-# machinelearningmastery.com/simulated-annealing-from-scratch-in-python/
-# for details of this implementation.
-
-
-def acceptance_criterion(gain: int, iteration: int, initial_temperature: float = 1):
-    """Acceptance criterion, to be used during simulated annealing.
-    If ``gain`` is positive (improvement) the output will be greater than 1.
-    If ``gain`` is negative the output will be a probability from 0 to 1.
-
-    :param gain: Change in objective function.
-    :type gain: int
-    :param iteration: Current iteration.
-    :type iteration: int
-    :param initial_temperature: Initial temperature, defaults to 1.
-    :type initial_temperature: float, optional
-    :return: acceptance criterion.
-    :rtype: float
-    """
-
-    temperature = initial_temperature / (iteration + 1)
-    try:
-        acceptance = math.exp(gain / temperature)
-    except OverflowError:
-        acceptance = float("inf")
-    return acceptance
 
 
 class Annealing(Allocator):
@@ -77,11 +57,16 @@ class Annealing(Allocator):
         :return: Distribution of ``circ`` onto ``network``.
         :rtype: Distribution
 
-        :key seed: Seed for randomness. Default is None
+        :key seed: Seed for randomness. Default is None.
         :key iterations: The number of iterations in the annealing procedure.
             Default is 10000.
         :key initial_place_method: Allocator to use to find the initial
-            placement. Default is Random.
+            placement. Default is Random().
+            Note: The default Random() initializer does not consume user seeds
+            deterministically. For guaranteed cross-platform reproducibility, pass
+            a deterministic initial placement method such as any from the following
+            set: Ordered, HypergraphPartitioning, Brute, or pass an explicitly
+            seeded wrapper around Random.
         :key cache_limit: The maximum size of the set of servers whose cost is
             stored in cache; see GainManager. Default value is 5.
         :key initial_temperature: Initial temperature of annealing procedure.
@@ -98,91 +83,39 @@ class Annealing(Allocator):
         cache_limit = kwargs.get("cache_limit", None)
         initial_temperature = kwargs.get("initial_temperature", 3)
 
-        random.seed(seed)
-
-        # The annealing procedure requires an initial placement to work with.
-        # An initial placement is arrived at here.
-        distribution = initial_aloc.allocate(circ, network)
-
-        # TODO: Check that the initial placement does not have cost 0, and
-        # that not all qubits are already in the same server etc.
-
-        # We will use a ``GainManager`` to manage the calculation of gains
-        # (and management of pre-computed values) in a transparent way
-        gain_manager = GainManager(distribution)
-        if cache_limit is not None:
-            gain_manager.set_max_key_size(cache_limit)
-
-        # For each step of the annealing process, try a slight altering of the
-        # placement to see if it improves. Change to new placement if there is
-        # an improvement. Change to new placement with small probability if
-        # there is no improvement.
-        for i in range(iterations):
-            # Choose a random vertex to move.
-            vertex_to_move = random.choice(distribution.circuit.vertex_list)
-
-            # Find the server in which the chosen vertex resides.
-            home_server = gain_manager.current_server(vertex_to_move)
-
-            # Pick a random server to move to.
-            possible_servers = network.get_server_list()
-            possible_servers.remove(home_server)
-            destination_server = random.choice(possible_servers)
-
-            # If the vertex to move corresponds to a qubit
-            swap_vertex = None
-            if (
-                distribution.circuit._vertex_circuit_map[vertex_to_move]["type"]
-                == "qubit"
-            ):
-                # List all qubit vertices
-                dest_qubit_list = distribution.circuit.get_qubit_vertices()
-
-                # Gather qubits in ``destination_server``
-                dest_qubit_list = [
-                    v
-                    for v in dest_qubit_list
-                    if (gain_manager.current_server(v) == destination_server)
-                ]
-
-                q_in_dest = len(dest_qubit_list)
-                size_dest = len(network.server_qubits[destination_server])
-
-                # If destination server is full, pick a random qubit in that
-                # server and move it to the home server of the qubit
-                # being moved.
-                if q_in_dest == size_dest:
-                    swap_vertex = random.choice(dest_qubit_list)
-
-            # Calculate gain
-            gain = gain_manager.move_vertex_gain(vertex_to_move, destination_server)
-            if swap_vertex is not None:
-                # In order to accurately calculate the gain of moving
-                # ``swap_vertex`` we need to move ``vertex_to_move``
-                gain_manager.move_vertex(
-                    vertex_to_move, destination_server, recalculate_cost=False
-                )
-                gain += gain_manager.move_vertex_gain(swap_vertex, home_server)
-                # Restore ``vertex_to_move`` to its original placement
-                gain_manager.move_vertex(
-                    vertex_to_move, home_server, recalculate_cost=False
-                )
-
-            acceptance_prob = acceptance_criterion(
-                gain=gain,
-                iteration=i,
-                initial_temperature=initial_temperature,
+        if "initial_place_method" not in kwargs and seed is not None:
+            warn_once(
+                "Annealing_default_random_seed",
+                message=(
+                    "Annealing: the default Random() initializer does not consume the "
+                    "seed deterministically. For guaranteed cross-platform reproducibility, "
+                    "pass a deterministic initial placement method such as any from the "
+                    "following set: Ordered, HypergraphPartitioning, Brute, or pass an "
+                    "explicitly seeded wrapper around Random."
+                ),
+                stacklevel=2,
             )
 
-            # If acceptance probability is higher than random number then
-            # ten accept new placement. Note that new placement is always
-            # accepted if it is better than the old one.
-            # TODO: Should new placement be accepted if the cost
-            # does not change?
-            if acceptance_prob > random.uniform(0, 1):
-                gain_manager.move_vertex(vertex_to_move, destination_server)
-                if swap_vertex is not None:
-                    gain_manager.move_vertex(swap_vertex, home_server)
+        # Stage 1: The annealing procedure requires an initial placement to work with.
+        # Run the initial placement allocator (Ordered, HypergraphPartitioning,
+        # Brute, Random, or any custom allocator).
+        random.seed(seed)
+        distribution = initial_aloc.allocate(circ, network)
 
-        assert gain_manager.distribution.is_valid()
-        return gain_manager.distribution
+        # Stage 2: Simulated Annealing from the initial placement, executed in
+        # the compiled core.  Python's ambient RNG state is handed over and the
+        # post-loop state is installed again, matching the reference's use of
+        # the module-level generator.  ``reseed=False`` keeps any draws Stage 1
+        # already consumed.
+        core_dist = call_with_python_rng(
+            core.annealing_from_placement_with_state,
+            core_hypergraph_circuit(dist_circ),
+            core_placement(distribution.placement),
+            core_network(network),
+            int(iterations),
+            float(initial_temperature),
+            cache_limit,
+            normalize_seed(seed),
+            reseed=False,
+        )
+        return distribution_from_core(core_dist, dist_circ, network)

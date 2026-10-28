@@ -104,3 +104,26 @@ TEST_CASE("PyRandom.choice matches CPython") {
     REQUIRE(r.choice(seq) == e);
   }
 }
+
+TEST_CASE("PyRandom unseeded is non-deterministic") {
+  PyRandom r1;
+  PyRandom r2;
+  const auto v1 = draw_random(r1, 10);
+  const auto v2 = draw_random(r2, 10);
+  REQUIRE(v1 != v2);
+}
+
+TEST_CASE("PyRandom get_state and set_state roundtrips exactly") {
+  PyRandom r1(42);
+  draw_random(r1, 15);
+  const auto state = r1.get_state();
+  REQUIRE(state.size() == 625);
+
+  const auto next_r1 = draw_random(r1, 20);
+
+  PyRandom r2(999);
+  r2.set_state(state);
+  const auto next_r2 = draw_random(r2, 20);
+
+  REQUIRE(next_r1 == next_r2);
+}

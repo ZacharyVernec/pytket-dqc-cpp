@@ -35,7 +35,10 @@ import warnings
 
 HASH_SEEDS = ["0", "1", "42", "12345"]
 
-if os.environ.get("DQC_ADAPTER_HASH_SWEEP") != "1" and "PYTHONHASHSEED" not in os.environ:
+if (
+    os.environ.get("DQC_ADAPTER_HASH_SWEEP") != "1"
+    and os.environ.get("DQC_ADAPTER_SINGLE_SEED") != "1"
+):
     script = os.path.abspath(__file__)
     for _seed in HASH_SEEDS:
         _env = dict(os.environ)
@@ -50,6 +53,7 @@ sys.path.insert(0, os.path.join(ROOT, "python"))
 
 import pytket_dqc as ref  # noqa: E402
 import pytket_dqc.allocators  # noqa: E402,F401 - exposed as attributes upstream
+import pytket_dqc.distributors  # noqa: E402,F401
 import pytket_dqc.packing  # noqa: E402,F401
 import pytket_dqc.refiners  # noqa: E402,F401
 
@@ -57,6 +61,7 @@ import networkx as nx  # noqa: E402
 import pytket_dqc_cpp as new  # noqa: E402
 from pytket import Circuit, OpType  # noqa: E402
 from pytket_dqc.utils import graph_tools as ref_graph_tools  # noqa: E402
+from pytket_dqc_cpp._bridge import core as new_core  # noqa: E402
 from pytket_dqc_cpp._delegation import reset_warnings  # noqa: E402
 from pytket_dqc_cpp.utils import graph_tools as new_graph_tools  # noqa: E402
 
@@ -66,6 +71,22 @@ warnings.simplefilter("ignore", UserWarning)
 
 FAILURES: list[str] = []
 CHECKS = [0]
+SKIPPED = [0]
+MIN_CHECKS_BASELINE = 850
+
+# Seeded allocator matrix: zero, ordinary seeds, negative seeds (CPython's
+# ``random.seed`` uses ``abs(seed)``) and a seed above 32 bits that still fits
+# the core's ``uint64`` binding.
+RANDOM_SEEDS = (0, 7, -1, -5, 2**63 + 5)
+
+
+def skip(reason=""):
+    SKIPPED[0] += 1
+    if reason:
+        print(f"SKIP: {reason}", flush=True)
+
+
+record_skip = skip
 
 
 def progress(section):
@@ -283,7 +304,7 @@ def check_hypergraph_circuit(name):
 
 
 def allocation_cases():
-    """Yield ``(tag, ref_dist, new_dist)`` for each allocator/network case."""
+    """Yield ``(tag, circuit, ref_network, new_network, ref_dist, new_dist)`` for each allocator/network case."""
     for name, maker in CIRCUITS.items():
         for index, (coupling, server_qubits) in enumerate(network_blueprints()):
             circuit = compile_circuit(maker())
@@ -291,12 +312,14 @@ def allocation_cases():
             new_network = make_network(new, coupling, server_qubits)
             tag = f"{name}/net{index}"
 
-            try:
-                ref_dist = ref.allocators.Ordered().allocate(circuit, ref_network)
-            except Exception as exc:  # noqa: BLE001 - network too small for circuit
-                print(f"skip {tag}: {type(exc).__name__}: {exc}", flush=True)
+            ref_outcome = outcome(lambda: ref.allocators.Ordered().allocate(circuit, ref_network))
+            new_outcome = outcome(lambda: new.allocators.Ordered().allocate(circuit, new_network))
+            if isinstance(ref_outcome, tuple) or isinstance(new_outcome, tuple):
+                check(f"{tag}: capacity exception parity", ref_outcome == new_outcome)
                 continue
-            new_dist = new.allocators.Ordered().allocate(circuit, new_network)
+
+            ref_dist = ref_outcome
+            new_dist = new_outcome
 
             check(
                 f"{tag}: Ordered placement",
@@ -307,9 +330,7 @@ def allocation_cases():
 
 
 def check_random_allocator(tag, circuit, ref_network, new_network):
-    if len(circuit.qubits) > 5:
-        return
-    for seed in (0, 7):
+    for seed in RANDOM_SEEDS:
         ref_dist = outcome(lambda: ref.allocators.Random().allocate(circuit, ref_network, seed=seed))
         new_dist = outcome(lambda: new.allocators.Random().allocate(circuit, new_network, seed=seed))
         if isinstance(ref_dist, tuple) or isinstance(new_dist, tuple):
@@ -341,8 +362,6 @@ def check_brute_allocator(case, circuit, coupling, server_qubits):
 
 
 def check_annealing_allocator(tag, circuit, ref_network, new_network):
-    if len(circuit.qubits) > 5:
-        return
     kwargs = dict(
         seed=11,
         iterations=200,
@@ -442,25 +461,24 @@ def check_refiners(tag, ref_dist, new_dist):
         check(f"{tag}/{ref_name}: cost", ref_clone.cost() == new_clone.cost())
 
     # VertexCover runs in Python on both sides (networkx cover selection only).
-    if len(new_dist.circuit.vertex_list) <= 40:
-        ref_clone = ref.Distribution.from_dict(ref_dist.to_dict())
-        new_clone = new.Distribution.from_dict(new_dist.to_dict())
-        ref_result = outcome(lambda: ref.refiners.VertexCover().refine(ref_clone))
-        new_result = outcome(lambda: new.refiners.VertexCover().refine(new_clone))
+    ref_clone = ref.Distribution.from_dict(ref_dist.to_dict())
+    new_clone = new.Distribution.from_dict(new_dist.to_dict())
+    ref_result = outcome(lambda: ref.refiners.VertexCover().refine(ref_clone))
+    new_result = outcome(lambda: new.refiners.VertexCover().refine(new_clone))
+    check(
+        f"{tag}/VertexCover: refine outcome",
+        ref_result == new_result,
+        f"ref={ref_result} new={new_result}",
+    )
+    if not (isinstance(ref_result, tuple) or isinstance(new_result, tuple)):
         check(
-            f"{tag}/VertexCover: refine outcome",
-            ref_result == new_result,
-            f"ref={ref_result} new={new_result}",
+            f"{tag}/VertexCover: hyperedges",
+            hedge_rows(ref_clone.circuit) == hedge_rows(new_clone.circuit),
         )
-        if not (isinstance(ref_result, tuple) or isinstance(new_result, tuple)):
-            check(
-                f"{tag}/VertexCover: hyperedges",
-                hedge_rows(ref_clone.circuit) == hedge_rows(new_clone.circuit),
-            )
-            check(
-                f"{tag}/VertexCover: placement",
-                ref_clone.placement.placement == new_clone.placement.placement,
-            )
+        check(
+            f"{tag}/VertexCover: placement",
+            ref_clone.placement.placement == new_clone.placement.placement,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -609,6 +627,315 @@ def check_graph_tools():
 
 
 # ---------------------------------------------------------------------------
+# 9. RNG semantics
+# ---------------------------------------------------------------------------
+
+
+def make_rng_circuit():
+    return (
+        Circuit(4)
+        .add_gate(OpType.CU1, 1.0, [0, 1])
+        .H(1)
+        .add_gate(OpType.CU1, 1.0, [1, 2])
+        .H(2)
+        .add_gate(OpType.CU1, 1.0, [2, 3])
+        .H(3)
+    )
+
+
+def make_rng_network(package):
+    return package.NISQNetwork(
+        [[0, 1], [0, 2]], {0: [0], 1: [1, 2], 2: [3, 4]}
+    )
+
+
+def ordered_clone(package, circuit, network):
+    """Build a deterministic starting distribution for refiner checks."""
+    return package.Distribution.from_dict(
+        package.allocators.Ordered().allocate(circuit, network).to_dict()
+    )
+
+
+def check_refiner_seeds(name, ref_factory, new_factory, circuit, ref_network, new_network, seeds):
+    """Compare seeded refiner tie-breaking, including negative seeds."""
+    for seed in seeds:
+        ref_clone = ordered_clone(ref, circuit, ref_network)
+        new_clone = ordered_clone(new, circuit, new_network)
+        ref_result = outcome(lambda: ref_factory().refine(ref_clone, seed=seed))
+        new_result = outcome(lambda: new_factory().refine(new_clone, seed=seed))
+        check(
+            f"rng/{name}(seed={seed}): outcome",
+            ref_result == new_result,
+            f"ref={ref_result} new={new_result}",
+        )
+        if isinstance(ref_result, tuple) or isinstance(new_result, tuple):
+            continue
+        check(
+            f"rng/{name}(seed={seed}): hyperedges",
+            hedge_rows(ref_clone.circuit) == hedge_rows(new_clone.circuit),
+        )
+        check(
+            f"rng/{name}(seed={seed}): placement",
+            ref_clone.placement.placement == new_clone.placement.placement,
+        )
+        check(
+            f"rng/{name}(seed={seed}): cost",
+            ref_clone.cost() == new_clone.cost(),
+        )
+
+
+def check_rng_semantics():
+    """Seeded RNG parity across allocators, refiners and the core RNG.
+
+    The reference consumes CPython's MT19937 stream, while the adapter uses the
+    bit-exact ``PyRandom`` core implementation.  Equal integer seeds must yield
+    identical decisions, including negative seeds (where CPython applies its
+    ``abs(seed)`` rule).
+    """
+    circuit = compile_circuit(make_rng_circuit())
+    ref_network = make_rng_network(ref)
+    new_network = make_rng_network(new)
+
+    check_refiner_seeds(
+        "BoundaryReallocation",
+        ref.refiners.BoundaryReallocation,
+        new.refiners.BoundaryReallocation,
+        circuit,
+        ref_network,
+        new_network,
+        seeds=(0, 7, 42, -1, -5),
+    )
+    check_refiner_seeds(
+        "DetachedGates",
+        ref.refiners.DetachedGates,
+        new.refiners.DetachedGates,
+        circuit,
+        ref_network,
+        new_network,
+        seeds=(0, 5, -5),
+    )
+
+    # KaHyPar receives the seed directly, so negative seeds are passed through
+    # unchanged (unlike CPython's abs() rule for ``random.seed``).
+    for seed in (0, 1, 42, -5, 12345):
+        ref_dist = outcome(
+            lambda: ref.allocators.HypergraphPartitioning().allocate(
+                circuit, ref_network, seed=seed
+            )
+        )
+        new_dist = outcome(
+            lambda: new.allocators.HypergraphPartitioning().allocate(
+                circuit, new_network, seed=seed
+            )
+        )
+        ref_raised = isinstance(ref_dist, tuple)
+        new_raised = isinstance(new_dist, tuple)
+        check(
+            f"rng/HypergraphPartitioning(seed={seed}): outcome",
+            ref_raised == new_raised and (not ref_raised or ref_dist == new_dist),
+            f"ref={ref_dist} new={new_dist}",
+        )
+        if ref_raised or new_raised:
+            continue
+        check(
+            f"rng/HypergraphPartitioning(seed={seed}): placement",
+            ref_dist.placement.placement == new_dist.placement.placement,
+        )
+        check(
+            f"rng/HypergraphPartitioning(seed={seed}): cost",
+            ref_dist.cost() == new_dist.cost(),
+        )
+
+    # The reference annealing loop consumes the ambient Python RNG; the adapter
+    # forwards that same state into `_core.annealing_from_placement`.  Compare
+    # the full trajectory for several seeds, then exercise the deterministic
+    # non-Random initializers documented as cross-library reproducible.
+    for seed in (0, 11, 42, -5):
+        ref_dist = ref.allocators.Annealing().allocate(
+            circuit,
+            ref_network,
+            seed=seed,
+            iterations=200,
+            initial_place_method=ref.allocators.Ordered(),
+        )
+        new_dist = new.allocators.Annealing().allocate(
+            circuit,
+            new_network,
+            seed=seed,
+            iterations=200,
+            initial_place_method=new.allocators.Ordered(),
+        )
+        check(
+            f"rng/Annealing(Ordered, seed={seed}): placement",
+            ref_dist.placement.placement == new_dist.placement.placement,
+        )
+        check(
+            f"rng/Annealing(Ordered, seed={seed}): cost",
+            ref_dist.cost() == new_dist.cost(),
+        )
+
+    for name, ref_factory, new_factory in (
+        ("Brute", ref.allocators.Brute, new.allocators.Brute),
+        (
+            "HypergraphPartitioning",
+            ref.allocators.HypergraphPartitioning,
+            new.allocators.HypergraphPartitioning,
+        ),
+    ):
+        seed = 11
+        ref_dist = ref.allocators.Annealing().allocate(
+            circuit,
+            ref_network,
+            seed=seed,
+            iterations=50,
+            initial_place_method=ref_factory(),
+        )
+        new_dist = new.allocators.Annealing().allocate(
+            circuit,
+            new_network,
+            seed=seed,
+            iterations=50,
+            initial_place_method=new_factory(),
+        )
+        check(
+            f"rng/Annealing({name}, seed={seed}): placement",
+            ref_dist.placement.placement == new_dist.placement.placement,
+        )
+        check(
+            f"rng/Annealing({name}, seed={seed}): cost",
+            ref_dist.cost() == new_dist.cost(),
+        )
+
+    # Distributors forward the same seed into their allocator/refiner stages.
+    for seed in (0, 11, -5):
+        ref_dist = ref.distributors.PartitioningAnnealing().distribute(
+            circuit,
+            ref_network,
+            seed=seed,
+            iterations=50,
+            initial_place_method=ref.allocators.Ordered(),
+        )
+        new_dist = new.distributors.PartitioningAnnealing().distribute(
+            circuit,
+            new_network,
+            seed=seed,
+            iterations=50,
+            initial_place_method=new.allocators.Ordered(),
+        )
+        check(
+            f"rng/PartitioningAnnealing(seed={seed}): placement",
+            ref_dist.placement.placement == new_dist.placement.placement,
+        )
+        check(
+            f"rng/PartitioningAnnealing(seed={seed}): cost",
+            ref_dist.cost() == new_dist.cost(),
+        )
+
+    for seed in (0, 11, -5):
+        ref_dist = ref.distributors.PartitioningHeterogeneous().distribute(
+            circuit, ref_network, seed=seed
+        )
+        new_dist = new.distributors.PartitioningHeterogeneous().distribute(
+            circuit, new_network, seed=seed
+        )
+        check(
+            f"rng/PartitioningHeterogeneous(seed={seed}): placement",
+            ref_dist.placement.placement == new_dist.placement.placement,
+        )
+        check(
+            f"rng/PartitioningHeterogeneous(seed={seed}): cost",
+            ref_dist.cost() == new_dist.cost(),
+        )
+
+    ref_dist = ref.distributors.PartitioningHeterogeneousEmbedding().distribute(
+        circuit, ref_network, seed=11
+    )
+    new_dist = new.distributors.PartitioningHeterogeneousEmbedding().distribute(
+        circuit, new_network, seed=11
+    )
+    check(
+        "rng/PartitioningHeterogeneousEmbedding(seed=11): placement",
+        ref_dist.placement.placement == new_dist.placement.placement,
+    )
+    check(
+        "rng/PartitioningHeterogeneousEmbedding(seed=11): cost",
+        ref_dist.cost() == new_dist.cost(),
+    )
+
+    # Direct core-RNG check for the negative-seed abs() rule.
+    for seed in (-1, -5, -12345):
+        ref_rng = random.Random(seed)
+        new_rng = getattr(new_core, "PyRandom")(abs(seed))
+        check(
+            f"rng/PyRandom(seed={seed}): CPython abs semantics",
+            [ref_rng.random() for _ in range(20)]
+            == [new_rng.random() for _ in range(20)],
+        )
+
+    # Python-visible RNG state must match the reference after every call that
+    # consumes randomness: the adapter round-trips the 625-word MT19937 state.
+    random.seed(123)
+    ref.allocators.Random().allocate(circuit, ref_network, seed=7)
+    ref_state = random.getstate()
+    random.seed(123)
+    new.allocators.Random().allocate(circuit, new_network, seed=7)
+    check(
+        "rng/Random(seed=7): post-call global RNG state matches reference",
+        random.getstate() == ref_state,
+    )
+
+    random.seed(123)
+    before = random.getstate()
+    new.allocators.Random().allocate(circuit, new_network)
+    check(
+        "rng/Random(unseeded): adapter reseeds the global RNG from entropy",
+        random.getstate() != before,
+    )
+
+    for ref_refiner, new_refiner, kwargs in (
+        (ref.refiners.BoundaryReallocation, new.refiners.BoundaryReallocation, {"seed": 7}),
+        (ref.refiners.BoundaryReallocation, new.refiners.BoundaryReallocation, {}),
+        (ref.refiners.DetachedGates, new.refiners.DetachedGates, {"seed": 5}),
+        (ref.refiners.DetachedGates, new.refiners.DetachedGates, {}),
+    ):
+        random.seed(123)
+        ref_clone = ordered_clone(ref, circuit, ref_network)
+        ref_refiner().refine(ref_clone, **kwargs)
+        ref_state = random.getstate()
+        random.seed(123)
+        new_clone = ordered_clone(new, circuit, new_network)
+        new_refiner().refine(new_clone, **kwargs)
+        check(
+            f"rng/{ref_refiner.__name__}({kwargs}): post-call global RNG "
+            "state matches reference",
+            random.getstate() == ref_state,
+        )
+
+    for seed in (0, 11, -5):
+        random.seed(999)
+        ref.allocators.Annealing().allocate(
+            circuit,
+            ref_network,
+            seed=seed,
+            iterations=200,
+            initial_place_method=ref.allocators.Ordered(),
+        )
+        ref_state = random.getstate()
+        random.seed(999)
+        new.allocators.Annealing().allocate(
+            circuit,
+            new_network,
+            seed=seed,
+            iterations=200,
+            initial_place_method=new.allocators.Ordered(),
+        )
+        check(
+            f"rng/Annealing(seed={seed}): post-call global RNG state matches reference",
+            random.getstate() == ref_state,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -669,10 +996,23 @@ def main():
     progress("graph tools")
     check_graph_tools()
 
+    progress("rng semantics")
+    check_rng_semantics()
+
     progress("import hygiene")
     check_import_hygiene()
 
     print()
+    if SKIPPED[0] > 0:
+        FAILURES.append(
+            f"Verification failure: {SKIPPED[0]} cases were skipped. All checks are required to run."
+        )
+
+    if CHECKS[0] < MIN_CHECKS_BASELINE:
+        FAILURES.append(
+            f"Verification failure: ran {CHECKS[0]} checks, expected at least {MIN_CHECKS_BASELINE}."
+        )
+
     print(f"{CHECKS[0]} checks, {len(FAILURES)} failures")
     if FAILURES:
         for failure in FAILURES:

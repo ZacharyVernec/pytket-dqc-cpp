@@ -105,18 +105,21 @@ inline void check_can_implement(
 }
 
 // Mirrors `Random.allocate`: returns a Distribution whose placement is the
-// random allocation.
-inline Distribution random_allocate(
+// random allocation, along with the updated 625-word PyRandom state.
+inline std::pair<Distribution, std::vector<std::uint32_t>>
+random_allocate_with_state(
     const HypergraphCircuit& dist_circ,
     const std::vector<std::pair<int, int>>& server_coupling,
     const std::vector<std::pair<int, std::vector<int>>>& server_qubits,
     const Graph& server_graph, const std::map<int, int>& server_ebit_mem,
-    std::optional<std::uint64_t> seed) {
+    std::optional<std::uint64_t> seed,
+    const std::optional<std::vector<std::uint32_t>>& rng_state =
+        std::nullopt) {
   check_can_implement(dist_circ, server_qubits);
   const std::vector<int> server_list = server_list_order(server_coupling);
 
-  PyRandom rng(std::uint64_t{0});
-  rng.seed(seed);
+  PyRandom rng(seed);
+  if (rng_state.has_value()) rng.set_state(*rng_state);
 
   Placement placement;
   for (const Vertex vertex : dist_circ.vertex_list()) {
@@ -136,8 +139,21 @@ inline Distribution random_allocate(
     }
     placement.set(vertex, random_server);
   }
-  return make_distribution(dist_circ, placement, server_graph, server_qubits,
-                           server_ebit_mem);
+  return {make_distribution(dist_circ, placement, server_graph, server_qubits,
+                            server_ebit_mem),
+          rng.get_state()};
+}
+
+// Mirrors `Random.allocate`: returns a Distribution whose placement is the
+// random allocation.
+inline Distribution random_allocate(
+    const HypergraphCircuit& dist_circ,
+    const std::vector<std::pair<int, int>>& server_coupling,
+    const std::vector<std::pair<int, std::vector<int>>>& server_qubits,
+    const Graph& server_graph, const std::map<int, int>& server_ebit_mem,
+    std::optional<std::uint64_t> seed) {
+  return random_allocate_with_state(dist_circ, server_coupling, server_qubits,
+                                    server_graph, server_ebit_mem, seed).first;
 }
 
 // Mirrors `Ordered.allocate`: returns a Distribution whose placement fills the
@@ -219,8 +235,11 @@ inline Distribution brute_allocate(
                            server_ebit_mem);
 }
 
-// Mirrors `Annealing.acceptance_criterion`. Overflow (math.exp raising
-// OverflowError and being caught) yields +inf here too.
+// Metropolis acceptance criterion for the annealing loop:
+// P = exp(gain / T) with T = initial_temperature / (iteration + 1).
+// This helper is internal to the core; the Python adapter no longer carries a
+// copy. Overflow (where Python's `math.exp` would raise OverflowError, caught
+// and mapped to infinity) yields +inf here too.
 inline double acceptance_criterion(int gain, int iteration,
                                    double initial_temperature = 1.0) {
   const double temperature = initial_temperature / (iteration + 1);
@@ -238,48 +257,18 @@ inline double acceptance_criterion(int gain, int iteration,
 // an `initial_place_method` wrapping `Random` with a fixed seed), the RNG is
 // re-seeded with that value instead of `None`, so the whole run is
 // deterministic and bit-comparable with the reference.
-inline Distribution annealing_allocate(
+// Simulated annealing loop starting from an established placement and using
+// the provided PyRandom generator.
+inline Distribution annealing_from_placement_impl(
     const HypergraphCircuit& dist_circ,
+    const Placement& placement,
     const std::vector<std::pair<int, int>>& server_coupling,
     const std::vector<std::pair<int, std::vector<int>>>& server_qubits,
     const Graph& server_graph, const std::map<int, int>& server_ebit_mem,
     int iterations, double initial_temperature,
-    std::optional<int> cache_limit, std::optional<std::uint64_t> seed,
-    std::optional<std::uint64_t> initial_place_seed = std::nullopt) {
+    std::optional<int> cache_limit, PyRandom& rng) {
   check_can_implement(dist_circ, server_qubits);
   const std::vector<int> server_list = server_list_order(server_coupling);
-
-  PyRandom rng(std::uint64_t{0});
-  rng.seed(seed);  // `random.seed(seed)` in Annealing.allocate
-  if (initial_place_seed.has_value()) {
-    // A seeded initial-placement allocator (e.g. the test helper wrapping
-    // Random with a fixed seed): `random.seed(SEED)`, then place.
-    rng.seed(initial_place_seed);
-  } else {
-    // Default `Random()` -> `random.seed(None)` (OS entropy): the reference
-    // bug (the seed passed to Annealing is discarded), replicated.
-    rng.seed(std::nullopt);
-  }
-
-  // Initial placement (Random.allocate with the seeding chosen above).
-  Placement placement;
-  for (const Vertex vertex : dist_circ.vertex_list()) {
-    bool server_full = true;
-    int random_server = 0;
-    while (server_full) {
-      random_server = rng.choice(server_list);
-      int n_qubits_placed = 0;
-      for (const auto& [v, s] : placement.entries) {
-        if (s == random_server && dist_circ.is_qubit_vertex(v)) {
-          ++n_qubits_placed;
-        }
-      }
-      server_full =
-          (n_qubits_placed ==
-           static_cast<int>(qubit_list_of(server_qubits, random_server).size()));
-    }
-    placement.set(vertex, random_server);
-  }
 
   std::map<int, std::vector<int>> sq_map(server_qubits.begin(),
                                          server_qubits.end());
@@ -330,6 +319,111 @@ inline Distribution annealing_allocate(
   }
   return make_distribution(dist_circ, distribution.placement, server_graph,
                            server_qubits, server_ebit_mem);
+}
+
+// Stage 2 of the two-stage Annealing pipeline: runs the simulated annealing loop
+// from an initial placement provided by any Stage 1 allocator.  The
+// `*_with_state` variant also returns the final 625-word generator state so the
+// caller can restore Python's ambient `random` module.
+inline std::pair<Distribution, std::vector<std::uint32_t>>
+annealing_from_placement_with_state(
+    const HypergraphCircuit& dist_circ,
+    const Placement& placement,
+    const std::vector<std::pair<int, int>>& server_coupling,
+    const std::vector<std::pair<int, std::vector<int>>>& server_qubits,
+    const Graph& server_graph, const std::map<int, int>& server_ebit_mem,
+    int iterations, double initial_temperature,
+    std::optional<int> cache_limit,
+    std::optional<std::uint64_t> seed = std::nullopt,
+    const std::optional<std::vector<std::uint32_t>>& rng_state = std::nullopt) {
+  PyRandom rng(seed);
+  if (rng_state.has_value()) {
+    rng.set_state(*rng_state);
+  }
+  Distribution distribution = annealing_from_placement_impl(
+      dist_circ, placement, server_coupling, server_qubits, server_graph,
+      server_ebit_mem, iterations, initial_temperature, cache_limit, rng);
+  return {distribution, rng.get_state()};
+}
+
+inline Distribution annealing_from_placement(
+    const HypergraphCircuit& dist_circ,
+    const Placement& placement,
+    const std::vector<std::pair<int, int>>& server_coupling,
+    const std::vector<std::pair<int, std::vector<int>>>& server_qubits,
+    const Graph& server_graph, const std::map<int, int>& server_ebit_mem,
+    int iterations, double initial_temperature,
+    std::optional<int> cache_limit,
+    std::optional<std::uint64_t> seed = std::nullopt,
+    const std::optional<std::vector<std::uint32_t>>& rng_state = std::nullopt) {
+  return annealing_from_placement_with_state(
+             dist_circ, placement, server_coupling, server_qubits, server_graph,
+             server_ebit_mem, iterations, initial_temperature, cache_limit,
+             seed, rng_state)
+      .first;
+}
+
+// Mirrors `Annealing.allocate`.  The `*_with_state` variant also returns the
+// final 625-word generator state so the caller can restore Python's ambient
+// `random` module.
+inline std::pair<Distribution, std::vector<std::uint32_t>>
+annealing_allocate_with_state(
+    const HypergraphCircuit& dist_circ,
+    const std::vector<std::pair<int, int>>& server_coupling,
+    const std::vector<std::pair<int, std::vector<int>>>& server_qubits,
+    const Graph& server_graph, const std::map<int, int>& server_ebit_mem,
+    int iterations, double initial_temperature,
+    std::optional<int> cache_limit, std::optional<std::uint64_t> seed,
+    std::optional<std::uint64_t> initial_place_seed = std::nullopt) {
+  check_can_implement(dist_circ, server_qubits);
+  const std::vector<int> server_list = server_list_order(server_coupling);
+
+  PyRandom rng(seed);
+  if (initial_place_seed.has_value()) {
+    rng.seed(initial_place_seed);
+  } else {
+    rng.seed(std::nullopt);
+  }
+
+  // Initial placement (Random.allocate with the seeding chosen above).
+  Placement placement;
+  for (const Vertex vertex : dist_circ.vertex_list()) {
+    bool server_full = true;
+    int random_server = 0;
+    while (server_full) {
+      random_server = rng.choice(server_list);
+      int n_qubits_placed = 0;
+      for (const auto& [v, s] : placement.entries) {
+        if (s == random_server && dist_circ.is_qubit_vertex(v)) {
+          ++n_qubits_placed;
+        }
+      }
+      server_full =
+          (n_qubits_placed ==
+           static_cast<int>(qubit_list_of(server_qubits, random_server).size()));
+    }
+    placement.set(vertex, random_server);
+  }
+
+  Distribution distribution = annealing_from_placement_impl(
+      dist_circ, placement, server_coupling, server_qubits, server_graph,
+      server_ebit_mem, iterations, initial_temperature, cache_limit, rng);
+  return {distribution, rng.get_state()};
+}
+
+inline Distribution annealing_allocate(
+    const HypergraphCircuit& dist_circ,
+    const std::vector<std::pair<int, int>>& server_coupling,
+    const std::vector<std::pair<int, std::vector<int>>>& server_qubits,
+    const Graph& server_graph, const std::map<int, int>& server_ebit_mem,
+    int iterations, double initial_temperature,
+    std::optional<int> cache_limit, std::optional<std::uint64_t> seed,
+    std::optional<std::uint64_t> initial_place_seed = std::nullopt) {
+  return annealing_allocate_with_state(
+             dist_circ, server_coupling, server_qubits, server_graph,
+             server_ebit_mem, iterations, initial_temperature, cache_limit,
+             seed, initial_place_seed)
+      .first;
 }
 
 }  // namespace dqc

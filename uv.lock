@@ -159,17 +159,6 @@ wheels = [
 ]
 
 [[package]]
-name = "dist-qft"
-version = "0.0.2"
-source = { virtual = "." }
-dependencies = [
-    { name = "pytket-dqc" },
-]
-
-[package.metadata]
-requires-dist = [{ name = "pytket-dqc", git = "https://github.com/CQCL/pytket-dqc.git" }]
-
-[[package]]
 name = "executing"
 version = "2.2.1"
 source = { registry = "https://pypi.org/simple" }
@@ -738,6 +727,17 @@ dependencies = [
     { name = "pytket-pyzx" },
     { name = "pyzx" },
 ]
+
+[[package]]
+name = "pytket-dqc-cpp"
+version = "0.0.2"
+source = { virtual = "." }
+dependencies = [
+    { name = "pytket-dqc" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "pytket-dqc", git = "https://github.com/CQCL/pytket-dqc.git" }]
 
 [[package]]
 name = "pytket-pyzx"

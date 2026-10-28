@@ -2,7 +2,7 @@
 
 Reads the result files from ``results_few_qpus_py/`` (the reference
 ``pytket_dqc`` run) or, with ``--cpp``, from ``results_few_qpus_cpp/`` (the C++
-``_core`` run), and writes the bar charts next to them.
+``pytket_dqc_cpp`` run), and writes the bar charts next to them.
 """
 
 import argparse

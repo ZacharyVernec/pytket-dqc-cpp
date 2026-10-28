@@ -160,4 +160,23 @@ std::uint64_t PyRandom::randrange(std::uint64_t start, std::uint64_t stop) {
   return start + randbelow(stop - start);
 }
 
+void PyRandom::set_state(const std::vector<std::uint32_t>& state625) {
+  if (state625.size() != static_cast<std::size_t>(kN + 1)) {
+    throw std::invalid_argument("state vector must contain exactly 625 elements");
+  }
+  for (int i = 0; i < kN; ++i) {
+    mt_[i] = state625[i];
+  }
+  mti_ = static_cast<int>(state625[kN]);
+}
+
+std::vector<std::uint32_t> PyRandom::get_state() const {
+  std::vector<std::uint32_t> state(kN + 1);
+  for (int i = 0; i < kN; ++i) {
+    state[i] = mt_[i];
+  }
+  state[kN] = static_cast<std::uint32_t>(mti_);
+  return state;
+}
+
 }  // namespace dqc

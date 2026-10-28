@@ -17,9 +17,11 @@
 from __future__ import annotations
 
 from .._bridge import (
+    call_with_python_rng,
     core,
     core_hypergraph_circuit,
     core_network,
+    normalize_seed,
 )
 from ..circuits.distribution import Distribution
 from ..circuits.hypergraph_circuit import HypergraphCircuit
@@ -53,15 +55,26 @@ class Random(Allocator):
         :type network: NISQNetwork
         :return: Distribution of ``circ`` onto ``network``.
         :rtype: Distribution
+
+        :key seed: Seed for randomness. Default is None, which reseeds Python's
+            global ``random`` generator from OS entropy exactly as the
+            reference does; the advanced state is installed back into
+            ``random`` when the call returns.
         """
 
         dist_circ = HypergraphCircuit(circ)
         if not network.can_implement(dist_circ):
             raise Exception("This circuit cannot be implemented on this network.")
 
-        seed = kwargs.get("seed", None)
+        # The core binding takes an unsigned integer; CPython's random.seed
+        # uses abs(seed), including for negative integers.
+        seed = normalize_seed(kwargs.get("seed", None))
 
-        core_distribution = core.random_allocate(
-            core_hypergraph_circuit(dist_circ), core_network(network), seed
+        core_distribution = call_with_python_rng(
+            core.random_allocate_with_state,
+            core_hypergraph_circuit(dist_circ),
+            core_network(network),
+            seed,
+            seed=seed,
         )
         return distribution_from_core(core_distribution, dist_circ, network)

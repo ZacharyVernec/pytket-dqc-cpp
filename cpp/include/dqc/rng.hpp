@@ -20,8 +20,8 @@ namespace dqc {
 
 class PyRandom {
  public:
-  // Mirrors `random.Random(seed)`. Defaults to seed 0 for determinism.
-  explicit PyRandom(std::optional<std::uint64_t> seed = std::uint64_t{0});
+  // Mirrors `random.Random(seed)`. Defaults to non-deterministic OS entropy (std::nullopt).
+  explicit PyRandom(std::optional<std::uint64_t> seed = std::nullopt);
 
   // Mirrors `random.seed(a)` for an integer seed (magnitude <= 2^64-1).
   // `std::nullopt` mirrors `random.seed(None)` (OS entropy, intentionally
@@ -60,6 +60,13 @@ class PyRandom {
   // Mirrors `random.getrandbits(k)`. Values are restricted to k <= 64, which
   // covers every use in pytket-dqc (randrange/choice over small ranges).
   std::uint64_t getrandbits(int k);
+
+  // Set the 625-word Mersenne Twister internal state (mt_[0..623] and mti_).
+  // Matches Python's random.getstate()[1].
+  void set_state(const std::vector<std::uint32_t>& state625);
+
+  // Return the 625-word Mersenne Twister internal state.
+  std::vector<std::uint32_t> get_state() const;
 
  private:
   std::uint32_t genrand_uint32();

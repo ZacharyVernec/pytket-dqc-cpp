@@ -27,7 +27,6 @@ from .._bridge import (
     core_hypergraph_circuit,
     core_placement,
     sync_from_core,
-    translate_core_error,
 )
 from ..networks import NISQNetwork
 from ..placement import Placement
@@ -430,10 +429,7 @@ class Distribution:
         # hyperedges in place, so the Python state is refreshed afterwards.
         core_dist = core_distribution(self)
 
-        try:
-            circuit = core_dist.to_pytket_circuit(satisfy_bound, allow_update)
-        except RuntimeError as exc:
-            raise translate_core_error(exc) from exc
+        circuit = core_dist.to_pytket_circuit(satisfy_bound, allow_update)
 
         if allow_update:
             sync_from_core(self, core_dist)

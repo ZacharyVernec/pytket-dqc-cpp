@@ -1,6 +1,6 @@
 # Implementation Plan: `pytket_dqc_cpp` Drop-in Adapter
 
-Scope: Python API only. No C++ or CMake changes.
+Scope: Python API adapter (completed) and approved targeted C++ fixes for RNG semantics and exception bindings (see `REMAINING_FIXES.md` and `docs/fixes/`).
 
 ## Context for the implementing agent
 
@@ -17,7 +17,7 @@ Scope: Python API only. No C++ or CMake changes.
 
 - Work top-to-bottom through phases; respect dependency notes.
 - Mark each checkbox when its acceptance criterion is met.
-- Do not edit `cpp/` or `CMakeLists.txt`.
+- Do not edit `cpp/` or `CMakeLists.txt` (note: relaxed only for approved C++ fixes recorded in `docs/fixes/`).
 - Do not add drawing methods.
 - Keep the reference package as a runtime dependency, but import it lazily only in delegated paths.
 - Run the phase gate commands before moving to the next phase.
@@ -36,7 +36,8 @@ Provide a `pytket_dqc_cpp` package that mirrors the public Python API of `pytket
 - Drawing stays out of scope.
 - `VertexCover` (both `networkx` and `all_brute_force`) and `get_min_covers` are Python ports.
 - `GainManager` is a Python port; its `steiner_tree` and `Distribution.hyperedge_cost` calls go through `_core`.
-- `Annealing.allocate` is the Python loop; `Random`, `Ordered`, `Brute`, `HypergraphPartitioning` use `_core`.
+- `Annealing.allocate` runs the initial placement allocator in Python and then calls `_core.annealing_from_placement_with_state`; `Random`, `Ordered`, `Brute`, `HypergraphPartitioning` use `_core`.
+- Every random-consuming boundary mirrors the reference's use of Python's ambient `random`: state in via `rng_state`, state out via `*_with_state`, then `random.setstate` (`Random`, `Annealing`, `BoundaryReallocation`, `DetachedGates`). KaHyPar is excluded (own RNG).
 - Other refiners use `_core` refiner functions and immediately sync Python state.
 - Vendored upstream tests are the interface acceptance gate, with `high_compute` excluded by default.
 
@@ -111,7 +112,7 @@ only succeeds when the extension is later installed inside the package.
 - [X] `core_graph(nx_graph)`: `_core.Graph` preserving node insertion order, edge insertion order and `weight` attributes.
 - [X] `core_distribution(dist)`: `_core.Distribution(core_hc, core_pl, core_graph, server_qubits, server_ebit_mem)`.
 - [X] `sync_from_core(dist, core_dist)`: clear and re-add Python hyperedges; replace `dist.placement.placement` with a plain dict copy.
-- [X] `translate_core_error(exc)`: convert `RuntimeError` for communication-memory violations into `pytket_dqc_cpp.utils.circuit_analysis.ConstraintException`; preserve `.server` when parseable; leave other errors unchanged.
+- [X] `translate_core_error(exc)`: convert `RuntimeError` for communication-memory violations into `pytket_dqc_cpp.utils.circuit_analysis.ConstraintException` (note: superseded in Fix 4 by direct pybind11 exception translation; helper removed).
 - [X] Do not rely on `_core.HypergraphCircuit.get_gate_of_vertex` (return type is not bound); use the Python `_vertex_circuit_map`.
 
 ### 1.4 `_delegation.py`
@@ -254,10 +255,10 @@ Notes and deviations:
   sorted map), so dicts after `allow_update=True` match the reference exactly.
 - `Distribution.to_pytket_circuit` necessarily imports `pytket_dqc.utils.gateset` inside the
   C++ binding, which rebuilds the `start_proc`/`end_proc` custom gates.
-- Known core divergence (no C++ changes in this plan): the communication-memory
-  `RuntimeError` message omits upstream's trailing `to_pytket_circuit(allow_update=True)`
-  hint and carries no `v_gate`, so the translated `ConstraintException` has
-  `.v_gate is None` (type, server and message prefix match).
+- Known core divergence (superseded in Fix 4): during the initial adapter phase (no C++ changes),
+  the communication-memory `RuntimeError` message omitted upstream's trailing `to_pytket_circuit(allow_update=True)`
+  hint and carried no `v_gate`. In follow-on Fix 4, C++ pybind11 translation was implemented, attaching
+  `.v_gate` and the guidance hint directly.
 - Gate 2 results: `ALL PHASE 2 CHECKS PASSED` (268 checks, repeated under
   `PYTHONHASHSEED` 0/1/42/12345) and a 150-case random fuzz over circuits x networks x
   placements with 0 mismatches (hyperedges, subcircuits, costs, gate lists, qubit maps,
@@ -291,7 +292,7 @@ Notes and deviations:
 - [X] `random.py`: `Random.allocate` calls `_core.random_allocate` and adapts circuit/placement/network.
 - [X] `ordered.py`: `order_reducing_size` copy; `Ordered.allocate` calls `_core.ordered_allocate`.
 - [X] `brute.py`: `Brute.allocate` calls `_core.brute_allocate`.
-- [X] `annealing.py`: `acceptance_criterion` copy; `Annealing.allocate` is the upstream Python loop with `iterations`, `initial_place_method`, `seed`, `cache_limit`, `initial_temperature`, using `GainManager` and Python `random`.
+- [X] `annealing.py`: `Annealing.allocate` runs the initial placement allocator in Python (`iterations`, `initial_place_method`, `seed`, `cache_limit`, `initial_temperature`), then calls `_core.annealing_from_placement_with_state` with the ambient Python RNG state (`random.getstate()`), installing the returned state with `random.setstate`. The earlier Python loop and `acceptance_criterion` copy were removed: the binding is unconditional, so the loop was unreachable dead code and the helper is internal to the core.
 - [X] `hypergraph_partitioning.py`: `allocate` calls `_core.hypergraph_partitioning_allocate`; `initial_distribute` calls `_core.hypergraph_partitioning_initial_placement`; `make_valid` is the Python `GainManager` loop; raise a clear error if `_core` lacks KaHyPar.
 - [X] `routing.py`: delegate to reference `Routing` with warning; convert network and result via dicts.
 - [X] Copy `km1_kKaHyPar_sea20.ini` into `python/pytket_dqc_cpp/allocators/`.
@@ -404,24 +405,24 @@ Gate 4: `import pytket_dqc_cpp as pytket_dqc` succeeds; `pytket_dqc.allocators.R
 - [X] `.venv/bin/python tests/python/check_adapter_equivalence.py` passes.
 - [X] `ctest --test-dir build --output-on-failure` passes.
 - [X] Optional: `PYTHONPATH=python .venv/bin/python -m pytest tests -m high_compute` passes or documented skips.
-- [X] `git diff --stat` shows no changes under `cpp/` or `CMakeLists.txt`.
+- [X] Initial adapter phase completed without C++ edits; follow-on approved fixes updated C++ RNG semantics and pybind11 exception translation (see `docs/fixes/`).
 
 ## Next plans (after this adapter plan)
 
-This plan (the adapter) is now complete. The follow-on work is, in order:
+This plan (the adapter) is now complete. The follow-on work status:
 
-1. **`REMAINING_FIXES.md`** — work through the open items in that document:
-   Fix 3 (RNG semantics of the default paths: `Annealing` default initializer,
-   unseeded refiners), Fix 4 (error attribute parity for
-   `ConstraintException.server` / `.v_gate`), and the Gates item (make the
-   verification gates automatic rather than manual/partly excluded).
+1. **`REMAINING_FIXES.md`** — **Implemented** in accordance with user decisions documented in `docs/fixes/`:
+   - Fix 3 (RNG semantics: `Annealing` default-initializer warning, non-deterministic OS entropy seeding via `PyRandom(std::nullopt)` with zero Python global RNG mutation, documented in `docs/fixes/01_*.md` and `02_*.md`).
+   - Fix 4 (Error attribute parity: C++ pybind11 translation populates `.v_gate` and remediation hint directly, documented in `docs/fixes/03_*.md`).
+   - Gates (Unified gate runner `tests/python/run_gates.sh`, strict zero-skip check count enforcement in `check_adapter_equivalence.py`, hash sweep enforcement, documented in `docs/fixes/04_*.md`).
 2. **Implement a build step** — package the project so it builds without the
    current manual `cmake` + `sys.path` workflow (compiled extension installed
    inside `pytket_dqc_cpp`, no `build/dqc_cpp` fallback needed, KaHyPar INI
    shipped with the package).
 
-The "no changes under `cpp/` or `CMakeLists.txt`" constraint applies to *this*
-plan only and is expected to be lifted by plan 2.
+The "no changes under `cpp/` or `CMakeLists.txt`" constraint applied to the
+initial adapter plan, and was lifted for approved fixes in `REMAINING_FIXES.md`
+(C++ RNG and pybind11 exception translation) and future build step plan 2.
 
 ## API surface checklist
 
@@ -443,7 +444,7 @@ Top-level: `HypergraphCircuit`, `Distribution`, `Placement`, `NISQNetwork`, `DQC
 
 `utils`: `dqc_gateset`, `dqc_gateset_predicate`, `DQCPass`, `to_euler_with_two_hadamards`, `is_antidiagonal`, `is_diagonal`, `is_distributable`, `distributable_1q_op_types`, `distributable_op_types`, `direct_from_origin`, `steiner_tree`, `ConstraintException`, `ebit_cost`, `ebit_memory_required`, `check_equivalence`, `to_qasm_str`.
 
-Module-level extras used by tests: `pytket_dqc_cpp.circuits.hypergraph.Vertex`, `pytket_dqc_cpp.utils.gateset.start_proc`, `end_proc`, `telep_proc`, `pytket_dqc_cpp.utils.qasm.to_qasm_str`, `pytket_dqc_cpp.allocators.annealing.acceptance_criterion`, `pytket_dqc_cpp.allocators.ordered.order_reducing_size`, `pytket_dqc_cpp.refiners.vertex_cover.get_min_covers`.
+Module-level extras used by tests: `pytket_dqc_cpp.circuits.hypergraph.Vertex`, `pytket_dqc_cpp.utils.gateset.start_proc`, `end_proc`, `telep_proc`, `pytket_dqc_cpp.utils.qasm.to_qasm_str`, `pytket_dqc_cpp.allocators.ordered.order_reducing_size`, `pytket_dqc_cpp.refiners.vertex_cover.get_min_covers`.
 
 ## Fidelity invariants
 
@@ -474,7 +475,7 @@ Module-level extras used by tests: `pytket_dqc_cpp.circuits.hypergraph.Vertex`, 
 - Every public name in the API surface checklist imports successfully.
 - Adapted upstream non-high-compute tests pass against `pytket_dqc_cpp`.
 - Core and adapter differential checks pass.
-- No changes under `cpp/` or `CMakeLists.txt`.
+- No unauthorized changes under `cpp/` or `CMakeLists.txt` (only approved RNG and exception fixes per `docs/fixes/`).
 - README documents usage, delegated slow paths and test commands.
 - Drawing remains absent.
 
@@ -486,7 +487,7 @@ Module-level extras used by tests: `pytket_dqc_cpp.circuits.hypergraph.Vertex`, 
 2. `GainManager`/`Annealing` exactness diverges.
    - Compare against reference `GainManager` step by step, then fall back to delegating the Python `GainManager` to the reference with conversion and warning.
 3. `to_pytket_circuit` exception translation misses a case.
-   - Inspect the `RuntimeError` message, extend `translate_core_error`, and add a regression test from the corresponding upstream test.
+   - Handled directly in `cpp/python/bindings.cpp` via pybind11 `ConstraintException` translation; regression tested in `tests/error_parity_test.py`.
 4. KaHyPar unavailable in the local `_core`.
    - Skip KaHyPar tests with a clear reason; keep `HypergraphPartitioning` raising an actionable error.
 5. Reference test fixtures fail to unpickle under pytket 2.16.

@@ -43,6 +43,12 @@ class DetachedGates(Refiner):
         :param distribution: Distribution to refine.
         :type distribution: Distribution
 
+        :key seed: Seed for randomness. Default is None: unseeded calls
+            continue Python's ambient ``random`` stream and return the advanced
+            state to it, exactly as upstream ``pytket_dqc`` does. For
+            reproducible results or cross-library parity, specify an explicit
+            integer seed.
+
         :return: Distribution where the placement updated.
         :rtype: Distribution
         """

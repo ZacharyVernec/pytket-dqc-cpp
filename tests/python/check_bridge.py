@@ -187,57 +187,6 @@ def check_sync_from_core(case):
     return py_dist.cost()
 
 
-def check_error_translation():
-    """1.3: constraint violations are translated back to ConstraintException."""
-    import types
-
-    try:
-        from pytket_dqc_cpp.utils.circuit_analysis import ConstraintException
-    except ImportError:  # pragma: no cover - Phase 1 only
-        # `utils.circuit_analysis` lands in Phase 2; install a stub mirroring
-        # the reference class so the parsing logic can still be checked.
-        module = types.ModuleType("pytket_dqc_cpp.utils.circuit_analysis")
-
-        class ConstraintException(Exception):  # noqa: D101
-            def __init__(self, message, server):
-                super().__init__(message)
-                self.server = server
-                self.v_gate = None
-
-        module.ConstraintException = ConstraintException
-        sys.modules["pytket_dqc_cpp.utils.circuit_analysis"] = module
-
-    memory = RuntimeError(
-        "Communication memory capacity of server 3 exceeded.\n"
-        "\tConsider setting allow_update to True."
-    )
-    translated = _bridge.translate_core_error(memory)
-    assert isinstance(translated, ConstraintException)
-    assert translated.server == 3
-
-    non_home = RuntimeError(
-        "Could not implement the gate 7 since it is placed on a non-home "
-        "server 2 and said server has memory capacity less than two."
-    )
-    translated = _bridge.translate_core_error(non_home)
-    assert isinstance(translated, ConstraintException)
-    assert translated.server == 2
-
-    amended = RuntimeError(
-        "The distribution could not be amended to satisfy the bound on "
-        "communication capacity."
-    )
-    translated = _bridge.translate_core_error(amended)
-    assert isinstance(translated, ConstraintException)
-    assert translated.server is None
-
-    other = RuntimeError("something else went wrong")
-    assert _bridge.translate_core_error(other) is other
-    value_error = ValueError("not a runtime error")
-    assert _bridge.translate_core_error(value_error) is value_error
-    print("error translation: OK")
-
-
 def check_delegation():
     """1.4: lazy reference import, dict round trip and one warning per feature."""
     reset_warnings()
@@ -320,7 +269,6 @@ def main():
     assert isinstance(merged_cost, int)
     print(f"sync from core: OK (refined cost {merged_cost})")
 
-    check_error_translation()
     check_delegation()
 
     print("ALL BRIDGE CHECKS PASSED")

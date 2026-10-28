@@ -7,8 +7,9 @@ through two independent implementations:
 * ``main_few_qpus_py.py`` / ``main_many_qpus_py.py`` -- the reference Python
   ``pytket_dqc`` package (results in ``results_few_qpus_py/`` /
   ``results_many_qpus_py/``),
-* ``main_few_qpus_cpp.py`` / ``main_many_qpus_cpp.py`` -- the C++ ``_core``
-  port (results in ``results_few_qpus_cpp/`` / ``results_many_qpus_cpp/``).
+* ``main_few_qpus_cpp.py`` / ``main_many_qpus_cpp.py`` -- the C++ adapter
+  ``pytket_dqc_cpp`` package (results in ``results_few_qpus_cpp/`` /
+  ``results_many_qpus_cpp/``).
 
 This checker runs all four, then compares the result files field by field with
 the same line parsing the plot scripts use, ignoring the two timing lines (the
@@ -58,6 +59,9 @@ def run_script(script, *args):
     env = dict(os.environ)
     env["PYTHONHASHSEED"] = HASH_SEED
     env["MPLBACKEND"] = "Agg"
+    repo_python = str(QFT_DIR.parents[2] / "python")
+    existing_pp = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = f"{repo_python}:{existing_pp}" if existing_pp else repo_python
 
     subprocess.run(cmd, cwd=QFT_DIR, env=env, check=True)
 

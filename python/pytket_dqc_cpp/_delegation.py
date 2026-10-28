@@ -42,7 +42,7 @@ __all__ = [
 #: Features delegated to the reference implementation, warned about once each.
 DEFAULT_MESSAGE = (
     "{feature} is not ported to the C++ core; delegating to the reference "
-    "`pytket_dqc` implementation, which is slower."
+    "`pytket_dqc` implementation."
 )
 
 #: Features already warned about in this process.

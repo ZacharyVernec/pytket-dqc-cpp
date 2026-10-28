@@ -24,8 +24,9 @@ combinatorial decisions of the ported algorithms.
 
 from __future__ import annotations
 
-import re
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+import operator
+import random
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import networkx as nx
 from pytket import Circuit, OpType
@@ -37,10 +38,67 @@ from . import _core as _core_module
 # the extension as `_core.core`.  When the extension is installed *inside* the
 # package, the shared object shadows `_core.py`, so `_core` is the extension
 # itself and has no `core` attribute.
-core = getattr(_core_module, "core", _core_module)
+#
+# Typed ``Any`` on purpose: the extension's members only exist once CMake has
+# built the pybind11 module, so no static analyser can see them.
+core: Any = getattr(_core_module, "core", _core_module)
+
+
+def normalize_seed(seed: Optional[int]) -> Optional[int]:
+    """Return the non-negative integer seed expected by the core bindings.
+
+    CPython's ``random.seed(a)`` uses ``abs(a)`` for integer seeds.  The
+    pybind11 seed parameters for the ``PyRandom``-backed entry points are
+    ``std::optional<std::uint64_t>``, so negative Python integers must be
+    normalised before crossing the boundary.
+    """
+    if seed is None:
+        return None
+    try:
+        value = operator.index(seed)
+    except TypeError:
+        raise TypeError(
+            f"seed must be an int or None, got {type(seed).__name__}"
+        ) from None
+    return abs(value)
+
+
+def call_with_python_rng(
+    fn: Callable[..., Tuple[Any, Sequence[int]]],
+    *args: Any,
+    seed: Optional[int] = None,
+    reseed: bool = True,
+    **kwargs: Any,
+) -> Any:
+    """Call a core ``*_with_state`` binding on Python's ambient RNG stream.
+
+    The reference implementations draw from the module-level :mod:`random`
+    generator, so the 625-word MT19937 state is handed to the core and the
+    state the core returns is installed again.  Python-visible RNG semantics --
+    including the state the caller observes after the call -- then match
+    upstream.
+
+    ``reseed`` mirrors the reference call pattern:
+
+    * ``True``: perform ``random.seed(seed)`` first (``None`` reseeds from OS
+      entropy).  Used by ``Random.allocate`` and ``Annealing.allocate``.
+    * ``False``: continue whatever stream the caller left.  Used by the
+      refiners, which only call ``random.seed`` when given an explicit seed.
+
+    ``gauss_next`` is carried through unchanged, since ``PyRandom`` models only
+    the 625 MT19937 words.
+    """
+    if reseed:
+        random.seed(seed)
+    before = random.getstate()
+    result, state = fn(*args, rng_state=list(before[1]), **kwargs)
+    random.setstate((3, tuple(state), before[2]))
+    return result
+
 
 __all__ = [
     "OP_TYPE_BY_CODE",
+    "call_with_python_rng",
     "command_from_core",
     "commands_from_core",
     "core_distribution",
@@ -48,6 +106,7 @@ __all__ = [
     "core_hypergraph_circuit",
     "core_network",
     "core_placement",
+    "normalize_seed",
     "nx_graph_from_core",
     "op_from_core",
     "op_type_from_code",
@@ -56,7 +115,6 @@ __all__ = [
     "serialize_circuit",
     "sync_from_core",
     "to_nx_graph",
-    "translate_core_error",
 ]
 
 # ---------------------------------------------------------------------------
@@ -303,50 +361,3 @@ def sync_from_core(distribution: Any, core_distribution_obj: Any) -> None:
     }
     for vertex, server in core_placement_map.items():
         distribution.placement.placement.setdefault(vertex, server)
-
-
-# ---------------------------------------------------------------------------
-# Error translation
-# ---------------------------------------------------------------------------
-
-#: Messages the core raises when the communication-memory constraint is hit.
-_CONSTRAINT_PREFIXES = (
-    "Communication memory capacity of server ",
-    "Could not implement the gate ",
-    "The distribution could not be amended to satisfy the bound",
-)
-
-_SERVER_PATTERNS = (
-    re.compile(r"Communication memory capacity of server (\d+)"),
-    re.compile(r"non-home server (\d+)"),
-)
-
-
-def _constraint_server(message: str) -> Optional[int]:
-    for pattern in _SERVER_PATTERNS:
-        match = pattern.search(message)
-        if match:
-            return int(match.group(1))
-    return None
-
-
-def translate_core_error(exc: BaseException) -> BaseException:
-    """Translate a core error into its ``pytket_dqc_cpp`` counterpart.
-
-    The core raises its internal ``ConstraintException`` as a plain
-    ``RuntimeError`` (pybind11 does not register the C++ type).  Those errors are
-    converted back into :class:`pytket_dqc_cpp.utils.circuit_analysis.ConstraintException`,
-    preserving the offending ``server`` when the message allows it.  Any other
-    error is returned unchanged, so callers can write
-    ``raise translate_core_error(exc) from exc``.
-    """
-    if not isinstance(exc, RuntimeError):
-        return exc
-    message = str(exc)
-    if not message.startswith(_CONSTRAINT_PREFIXES):
-        return exc
-
-    # Imported lazily: `utils.circuit_analysis` imports this module's siblings.
-    from .utils.circuit_analysis import ConstraintException
-
-    return ConstraintException(message, _constraint_server(message))

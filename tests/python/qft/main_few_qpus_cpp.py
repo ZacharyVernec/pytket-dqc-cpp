@@ -1,20 +1,14 @@
-"""C++ (``_core``) variant of ``main_few_qpus_py.py``: the Python ``pytket_dqc``
-compute is replaced by the C++ core (the ``_core`` pybind11 module built by
-CMake into ``build/dqc_cpp``).  ``pytket`` is only used to build and serialize
-the QFT circuit (the core has no circuit builder and depends on pytket's exact
-``get_commands()`` ordering); the DQC pipeline itself runs in ``_core``.
+"""C++ adapter (``pytket_dqc_cpp``) variant of ``main_few_qpus_py.py``.
 
-The ``_core`` mirror of the ``pytket_dqc`` API includes ``NISQNetwork``, the
-``RepeatRefiner``/``SequenceRefiner`` composition classes, and the
-KaHyPar-backed ``HypergraphPartitioning`` allocator
-(``_core.hypergraph_partitioning_allocate``), so the PE / PHE workflows here
-use the real KaHyPar initial partition.
+Runs the QFT few-QPUs distribution benchmarks through the ``pytket_dqc_cpp``
+package adapter instead of calling ``_core`` directly, keeping the structure,
+types, and calls as similar as possible to ``main_few_qpus_py.py``.
 
 Results are written to ``tests/python/qft/results_few_qpus_cpp/`` so they can
 be diffed against the reference ``tests/python/qft/results_few_qpus_py/`` (see
 ``tests/python/check_qft_equivalence.py``).
 
-Run: PYTHONHASHSEED=42 .venv/bin/python3 tests/python/qft/main_few_qpus_cpp.py
+Run: PYTHONHASHSEED=12345 .venv/bin/python3 tests/python/qft/main_few_qpus_cpp.py
 """
 
 import itertools
@@ -27,63 +21,44 @@ from pathlib import Path
 import numpy as np
 from pytket.circuit import Circuit as PytketCircuit
 
-# <repo>/tests/python/qft/<this file> -> <repo>
-QFT_DIR = Path(__file__).resolve().parent
-RESULTS_DIR = QFT_DIR / "results_few_qpus_cpp"
-ROOT = QFT_DIR.parents[2]
-sys.path.insert(0, str(ROOT / "build" / "dqc_cpp"))
-from _core import (  # noqa: E402
-    NISQNetwork,
-    HypergraphCircuit,
-    RepeatRefiner,
-    SequenceRefiner,
-    eager_h_type_merge_refine,
-    boundary_reallocation_refine,
-    vertex_cover_refine,
-    neighbouring_d_type_merge_refine,
-    intertwined_d_type_merge_refine,
-    detached_gates_refine,
-    annealing_allocate,
-    hypergraph_partitioning_allocate,
-    ebit_cost,
-)
+# Ensure the in-repo pytket_dqc_cpp adapter is importable
+ROOT = Path(__file__).resolve().parents[3]
+if str(ROOT / "python") not in sys.path:
+    sys.path.insert(0, str(ROOT / "python"))
+
+from pytket_dqc_cpp.allocators import Annealing, HypergraphPartitioning
+from pytket_dqc_cpp.allocators import Random as RandomAllocator
+from pytket_dqc_cpp.distributors import (Distributor,
+                                         PartitioningHeterogeneousEmbedding)
+from pytket_dqc_cpp.networks import NISQNetwork
+from pytket_dqc_cpp.refiners import (DetachedGates, EagerHTypeMerge,
+                                     IntertwinedDTypeMerge, NeighbouringDTypeMerge,
+                                     RepeatRefiner, SequenceRefiner, VertexCover)
+from pytket_dqc_cpp.utils import DQCPass, ebit_cost
+
 
 
 SEED = 56426435
 
-
-def serialize(circ):
-    qubits = [str(q) for q in circ.qubits]
-    cmds = [
-        (cmd.op.get_name(), int(cmd.op.type), [str(q) for q in cmd.qubits],
-         [float(p) for p in cmd.op.params])
-        for cmd in circ.get_commands()
-    ]
-    return qubits, cmds
+QFT_DIR = Path(__file__).resolve().parent
+RESULTS_DIR = QFT_DIR / "results_few_qpus_cpp"
 
 
-def get_QFT_circuit_core(num_qubits):
-    """Build the QFT as a ``pytket`` circuit and return the ``_core``
-    ``HypergraphCircuit`` the DQC pipeline consumes (the core has no circuit
-    builder). Mirrors ``get_QFT_circuit_pytket`` + ``HypergraphCircuit(circ)``."""
+def get_QFT_circuit_pytket(num_qubits):
     circ = PytketCircuit(num_qubits, name="$$QFT$$")
     for i in range(num_qubits):
         circ.H(num_qubits-1-i)
         for j in range(i + 1, num_qubits):
             circ.CU1(1 / 2 ** (j - i), num_qubits-1-i, num_qubits-1-j)
-    dist_circ = HypergraphCircuit()
-    qubits, cmds = serialize(circ)
-    dist_circ.from_circuit(qubits, cmds)
-    return dist_circ
+    return circ
 
-
-def test_PYTKET_PE(dist_circ, qpu_sizes, num_partitions):
+def test_PYTKET_PE(circuit, qpu_sizes, num_partitions):
     qpu_indices = list(range(num_partitions))
     qpu_cum_sizes = [0] + list(np.cumsum(qpu_sizes))
     qpu_qubits_ranges = [range(start, stop) for start,stop in zip(qpu_cum_sizes, qpu_cum_sizes[1:])]
 
     network = NISQNetwork(
-        server_coupling=[list(p) for p in itertools.product(qpu_indices, qpu_indices)], # fully connected
+        server_coupling=list(itertools.product(qpu_indices, qpu_indices)), # fully connected
         server_qubits={qpu_idx:list(qubits_range) for qpu_idx,qubits_range in enumerate(qpu_qubits_ranges)},
         server_ebit_mem={qpu_idx:2 for qpu_idx in qpu_indices}
     )
@@ -97,34 +72,30 @@ def test_PYTKET_PE(dist_circ, qpu_sizes, num_partitions):
     - PartitioningHeterogeneousEmbedding, that includes embedding
     but removing the boundary reallocation of the latter (i.e. removing the 'Heterogeneous' part).
     """
-    # HypergraphPartitioning (KaHyPar) + make_valid, in C++. Mirrors
-    # `HypergraphPartitioning().allocate(circuit, network, seed=SEED)`.
-    distribution = hypergraph_partitioning_allocate(dist_circ, network, seed=SEED)
-    refiner = RepeatRefiner(eager_h_type_merge_refine)
+    distribution = HypergraphPartitioning().allocate(circuit, network, seed=SEED)
+    refiner = RepeatRefiner(EagerHTypeMerge())
     refiner.refine(distribution)
-
+    
     stop = time.time()
     duration = stop - start
 
     cost = distribution.cost()
     start = time.time()
     distributed_circuit = distribution.to_pytket_circuit(allow_update=True)
-    qubits, cmds = serialize(distributed_circuit)
-    cost = ebit_cost(qubits, cmds)
+    cost = ebit_cost(distributed_circuit)
     stop = time.time()
     duration_fixing = stop - start
     detached_count = distribution.detached_gate_count()
 
     return cost, duration, duration_fixing, detached_count
 
-
-def test_PYTKET_PHE(dist_circ, qpu_sizes, num_partitions):
+def test_PYTKET_PHE(circuit, qpu_sizes, num_partitions):
     qpu_indices = list(range(num_partitions))
     qpu_cum_sizes = [0] + list(np.cumsum(qpu_sizes))
     qpu_qubits_ranges = [range(start, stop) for start,stop in zip(qpu_cum_sizes, qpu_cum_sizes[1:])]
 
     network = NISQNetwork(
-        server_coupling=[list(p) for p in itertools.product(qpu_indices, qpu_indices)], # fully connected
+        server_coupling=list(itertools.product(qpu_indices, qpu_indices)), # fully connected
         server_qubits={qpu_idx:list(qubits_range) for qpu_idx,qubits_range in enumerate(qpu_qubits_ranges)},
         server_ebit_mem={qpu_idx:2 for qpu_idx in qpu_indices}
     )
@@ -133,11 +104,8 @@ def test_PYTKET_PHE(dist_circ, qpu_sizes, num_partitions):
     """Equivalent to the workflow PartitionHeterogeneousEmbed 
     cited in [Andres-Matrinez et al. 2024] and recommended by Burt
     """
-    # HypergraphPartitioning (KaHyPar) + make_valid, in C++.
-    distribution = hypergraph_partitioning_allocate(dist_circ, network, seed=SEED)
-    boundary_reallocation_refine(distribution, seed=SEED)
-    refiner = RepeatRefiner(eager_h_type_merge_refine)
-    refiner.refine(distribution)
+
+    distribution = PartitioningHeterogeneousEmbedding().distribute(circuit, network, seed=SEED)
 
     stop = time.time()
     duration = stop - start
@@ -145,22 +113,20 @@ def test_PYTKET_PHE(dist_circ, qpu_sizes, num_partitions):
     cost = distribution.cost()
     start = time.time()
     distributed_circuit = distribution.to_pytket_circuit(allow_update=True)
-    qubits, cmds = serialize(distributed_circuit)
-    cost = ebit_cost(qubits, cmds)
+    cost = ebit_cost(distributed_circuit)
     stop = time.time()
     duration_fixing = stop - start
     detached_count = distribution.detached_gate_count()
 
     return cost, duration, duration_fixing, detached_count
 
-
-def test_PYTKET_AESD(dist_circ, qpu_sizes, num_partitions):
+def test_PYTKET_AESD(circuit, qpu_sizes, num_partitions):
     qpu_indices = list(range(num_partitions))
     qpu_cum_sizes = [0] + list(np.cumsum(qpu_sizes))
     qpu_qubits_ranges = [range(start, stop) for start,stop in zip(qpu_cum_sizes, qpu_cum_sizes[1:])]
 
     network = NISQNetwork(
-        server_coupling=[list(p) for p in itertools.product(qpu_indices, qpu_indices)], # fully connected
+        server_coupling=list(itertools.product(qpu_indices, qpu_indices)), # fully connected
         server_qubits={qpu_idx:list(qubits_range) for qpu_idx,qubits_range in enumerate(qpu_qubits_ranges)},
         server_ebit_mem={qpu_idx:2 for qpu_idx in qpu_indices}
     )
@@ -176,28 +142,31 @@ def test_PYTKET_AESD(dist_circ, qpu_sizes, num_partitions):
     - CoverEmbeddingSteiner, which includes the Steiner tree merging
     - CoverEmbeddingSteinerDetached, which includes the reallocation using detached gates
     """
-    # PartitioningAnnealing: mirrors
-    # `Annealing().allocate(circuit, network, seed=SEED,
-    #                       initial_place_method=SeededRandomAllocator())`.
-    distribution = annealing_allocate(dist_circ, network, seed=SEED,
-                                      initial_place_seed=SEED)
+    # PartitioningAnnealing
+    # Redefine random allocator to have allocate be called with a seed, since Annealing().allocate calls its initial_place_method without passing its seed
+    class SeededRandomAllocator(RandomAllocator):
+        def __init__(self):
+            self.random_allocator = RandomAllocator()
+        def allocate(self, circ, network, **kwargs):
+            dist = self.random_allocator.allocate(circ, network, seed=SEED, **kwargs)
+            from pytket_dqc_cpp._bridge import core, core_hypergraph_circuit, core_network
+            _, st = core.random_allocate_with_state(
+                core_hypergraph_circuit(dist.circuit), core_network(network), SEED
+            )
+            random.setstate((3, tuple(st), None))
+            return dist
+    distribution = Annealing().allocate(circuit, network, seed=SEED, initial_place_method=SeededRandomAllocator())
     # CoverEmbedding
-    # VertexCover rebuilds circuit + placement; the binding returns fresh
-    # copies, so assign them back onto the distribution.
-    new_h, new_p = vertex_cover_refine(distribution.circuit,
-                                       distribution.placement,
-                                       network.get_server_nx())
-    distribution.circuit = new_h
-    distribution.placement = new_p
+    VertexCover().refine(distribution)
     # Steiner
     refiner_list = [
-        neighbouring_d_type_merge_refine,
-        intertwined_d_type_merge_refine,
+        NeighbouringDTypeMerge(),
+        IntertwinedDTypeMerge(),
     ]
     refiner = RepeatRefiner(SequenceRefiner(refiner_list))
     refiner.refine(distribution)
     # Detached
-    detached_gates_refine(distribution, seed=SEED)
+    DetachedGates().refine(distribution, seed=SEED)
 
     stop = time.time()
     duration = stop - start
@@ -205,8 +174,7 @@ def test_PYTKET_AESD(dist_circ, qpu_sizes, num_partitions):
     cost = distribution.cost()
     start = time.time()
     distributed_circuit = distribution.to_pytket_circuit(allow_update=True)
-    qubits, cmds = serialize(distributed_circuit)
-    cost = ebit_cost(qubits, cmds)
+    cost = ebit_cost(distributed_circuit)
     stop = time.time()
     duration_fixing = stop - start
     detached_count = distribution.detached_gate_count()
@@ -234,9 +202,9 @@ def main():
         test_PYTKET_PHE, 
     ]
     qft_methods = [
-        get_QFT_circuit_core, 
-        get_QFT_circuit_core,
-        get_QFT_circuit_core, 
+        get_QFT_circuit_pytket, 
+        get_QFT_circuit_pytket,
+        get_QFT_circuit_pytket, 
     ]
 
     for get_QFT_circuit, test_method, method_name, result_filename in zip(qft_methods, test_methods, method_names, result_filenames):

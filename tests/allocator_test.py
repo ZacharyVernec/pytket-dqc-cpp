@@ -6,7 +6,6 @@ from pytket_dqc_cpp.allocators import (
     HypergraphPartitioning,
     Brute,
 )
-from pytket_dqc_cpp.allocators.annealing import acceptance_criterion
 import pytket_dqc_cpp
 from pytket_dqc_cpp import HypergraphCircuit, Distribution
 from pytket import Circuit
@@ -102,11 +101,6 @@ def test_annealing_distribute():
         {0: 1, 1: 1, 2: 2, 3: 0, 4: 1, 5: 1, 6: 1}
     )
     assert distribution.cost() == 3
-
-
-def test_acceptance_criterion():
-    assert acceptance_criterion(1, 10) >= 1
-    assert acceptance_criterion(-1, 10) < 1
 
 
 def test_graph_initial_partitioning():

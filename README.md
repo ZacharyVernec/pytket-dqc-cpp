@@ -26,7 +26,7 @@ The reference implementation is the upstream Python package `pytket_dqc` (Apache
   - Python `random` module = Mersenne Twister (MT19937) with CPython seeding (`init_by_array` over the little-endian 32-bit words of `|seed|`) and `random()` = `genrand_res53`. Ported as `dqc::PyRandom` (bit-exact).
   - `numpy.random.RandomState` (legacy MT19937) and `scipy.stats.unitary_group` are **not** reproduced in v1 (see deferrals).
 - Rule: move **whole** algorithms to C++; never split one algorithm's RNG consumption across the Python/C++ boundary.
-- `seed=None` means OS-entropy seeding in both languages and is intentionally non-deterministic (no cross-language match is defined). Negative seeds map to their absolute value (CPython semantics).
+- `seed=None` is intentionally non-deterministic (no cross-language match is defined; the C++ core initializes from OS entropy `std::random_device` without mutating Python's ambient RNG state). Negative seeds map to their absolute value (CPython semantics).
 
 ## Implemented (C++ core, v1)
 
@@ -87,9 +87,9 @@ from pytket_dqc.circuits import HypergraphCircuit   # before
 from pytket_dqc_cpp.circuits import HypergraphCircuit  # after
 ```
 
-Installing/using it means putting `python/` on `sys.path` (or installing the
-directory); `pytket_dqc_cpp._core` then locates the compiled extension in
-`build/dqc_cpp/` automatically, or raise an `ImportError` quoting the CMake
+Installing/using it means putting `python/` on `sys.path`;
+`pytket_dqc_cpp._core` then locates the compiled extension in
+`build/dqc_cpp/` automatically, or raises an `ImportError` quoting the CMake
 command if it has not been built.
 
 ## Runtime dependency on the reference package
@@ -101,33 +101,64 @@ core-backed code paths do not touch it.
 These features are not ported to the C++ core and delegate to `pytket_dqc` at
 call time, emitting **one `UserWarning` per feature per process**:
 
-| Delegated feature | Why |
-| --- | --- |
-| `allocators.Routing` | needs tket `PlacementPass` / `RoutingPass` / `DecomposeSwapsToCXs` |
-| `RandomHypergraphCircuit` | needs `scipy.stats.unitary_group.rvs(4)` |
-| `CyclicHypergraphCircuit` | upstream circuit generator |
-| `RegularGraphHypergraphCircuit` | needs `networkx.random_regular_graph` |
-| `utils.check_equivalence` (`to_pyzx`) | PyZX equivalence checking |
+| Delegated feature                         | Why                                                                      |
+| ----------------------------------------- | ------------------------------------------------------------------------ |
+| `allocators.Routing`                    | needs tket `PlacementPass` / `RoutingPass` / `DecomposeSwapsToCXs` |
+| `RandomHypergraphCircuit`               | needs `scipy.stats.unitary_group.rvs(4)`                               |
+| `CyclicHypergraphCircuit`               | upstream circuit generator                                               |
+| `RegularGraphHypergraphCircuit`         | needs `networkx.random_regular_graph`                                  |
+| `utils.check_equivalence` (`to_pyzx`) | PyZX equivalence checking                                                |
 
 They are correct but slower than the core-backed paths.
 
 ## Core-backed vs Python
 
-| Area | Implementation |
-| --- | --- |
-| `HypergraphCircuit` construction, subcircuits, H-embedding queries, `distribution_cost` | C++ core (`_core.HypergraphCircuit`) |
-| `Distribution.cost`, `hyperedge_cost`, `to_pytket_circuit`, validation helpers | C++ core (`_core.Distribution`) |
-| `steiner_tree`, `direct_from_origin`, `to_euler_with_two_hadamards`, `ebit_cost`, `ebit_memory_required`, `all_cu1_local`, `get_server_id`, `is_link_qubit` | C++ core |
-| `PacMan` (packets, neighbouring/hopping/merged, conflict graph) | C++ core (`_core.PacMan`) |
-| `Random`, `Ordered`, `Brute`, `HypergraphPartitioning`, `Annealing.allocate` | C++ core allocators |
-| `EagerHTypeMerge`, `NeighbouringDTypeMerge`, `IntertwinedDTypeMerge`, `BoundaryReallocation` | C++ core refiners |
-| `DetachedGates` | upstream Python `fixed_vertices` + `BoundaryReallocation` (the core entry point segfaults on hyperedges with no gate vertices; see "Known approximations") |
-| `GainManager`, `Annealing` loop, `VertexCover` / `get_min_covers`, `DQCPass`, placement/network/hypergraph data structures | pure Python (hot primitives go to the core) |
+| Area                                                                                                                                                                        | Implementation                                                                                                                                                 |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `HypergraphCircuit` construction, subcircuits, H-embedding queries, `distribution_cost`                                                                                 | C++ core (`_core.HypergraphCircuit`)                                                                                                                         |
+| `Distribution.cost`, `hyperedge_cost`, `to_pytket_circuit`, validation helpers                                                                                        | C++ core (`_core.Distribution`)                                                                                                                              |
+| `steiner_tree`, `direct_from_origin`, `to_euler_with_two_hadamards`, `ebit_cost`, `ebit_memory_required`, `all_cu1_local`, `get_server_id`, `is_link_qubit` | C++ core                                                                                                                                                       |
+| `PacMan` (packets, neighbouring/hopping/merged, conflict graph)                                                                                                           | C++ core (`_core.PacMan`)                                                                                                                                    |
+| `Random`, `Ordered`, `Brute`, `Annealing`, `HypergraphPartitioning`                                                                     | C++ core allocators                                                                                                                                            |
+| `EagerHTypeMerge`, `NeighbouringDTypeMerge`, `IntertwinedDTypeMerge`, `BoundaryReallocation`                                                                        | C++ core refiners                                                                                                                                              |
+| `DetachedGates`                                                                                                                                                           | upstream Python `fixed_vertices` + `BoundaryReallocation` (the core entry point segfaults on hyperedges with no gate vertices; see "Known approximations") |
+| `GainManager`, `VertexCover` / `get_min_covers`, `DQCPass`, placement/network/hypergraph data structures                                                           | pure Python (hot primitives go to the core)                                                                                                                    |
 
-`Annealing` is the upstream Python loop on top of the Python `GainManager`. Its
-default initial placement (`Random`) is core-backed and therefore does not
-advance Python's global `random` state; pass `initial_place_method=Ordered()` for
-a trajectory that is byte-for-byte reproducible against the reference.
+`Annealing.allocate` runs the initial placement allocator in Python, then hands that
+placement to `_core.annealing_from_placement_with_state`, which runs the annealing
+iterations in the compiled core. Python's ambient RNG state is forwarded
+(`random.getstate()`) and the post-loop state is installed back with
+`random.setstate`, so the stream after the call matches the reference.
+Its default initial placement method is `Random()`. Because the default `Random()`
+initializer calls `random.seed(None)` (OS entropy) when unseeded, calling
+`Annealing(seed=...)` with the default initializer reproduces upstream's
+non-determinism and emits a warning. For guaranteed bit-for-bit cross-library reproducibility against the
+reference, pass any deterministic initial placement method from the set
+`{Ordered(), HypergraphPartitioning(), Brute()}`. For reproducible randomized
+initial placements, pass an explicitly seeded wrapper around `Random`.
+
+### RNG semantics (ambient parity with upstream)
+
+Randomness crosses the Python/C++ boundary as the 625-word MT19937 state, and the
+core returns the post-call state, which `_bridge.call_with_python_rng` installs with
+`random.setstate`. Python-visible RNG semantics therefore match the reference:
+
+- **`Random.allocate` / `Annealing.allocate`** call `random.seed(seed)` first, so
+  `seed=None` reseeds the ambient generator from OS entropy (upstream's behaviour,
+  including the default-`Random()` annealing caveat above) and an explicit seed
+  resets the stream.
+- **`BoundaryReallocation` / `DetachedGates`** reseed only when an explicit seed is
+  passed; unseeded calls continue whatever ambient stream the caller left, exactly
+  as upstream does.
+- **After every such call**, `random.getstate()` equals the reference's state for the
+  same seed and inputs, so code that mixes adapter calls with module-level `random`
+  observes identical streams.
+- **Differential tests** compare both the placement and the post-call RNG state.
+  Unseeded runs reseed from independent OS entropy in each library, so result
+  comparisons still use explicit seeds.
+
+`HypergraphPartitioning` is excluded: KaHyPar uses its own RNG and upstream never
+touches Python's `random`.
 
 ## Frozen state
 
@@ -180,6 +211,7 @@ partition call (`detail::ScopedStdoutSilencer`).
 - `Hypergraph.vertex_neighbours` uses `std::set` (ascending) as a stand-in for CPython int-set iteration order. This is **not observable**: `vertex_neighbours` is only ever used for membership and in `get_boundary` (where iteration order does not affect the returned vertex list), never iterated in an order-sensitive way.
 - `PacMan.are_hoppable_packets` faithfully reproduces a reference bug: the "reverse the second 1q-op list and retry" fallback is dead code because the guard compares `op.params` (a list) to `0`, which is always `False`.
 - `PyRandom::seed` covers integer seeds `<= 2^64-1`; larger seeds (and arbitrary-int keys) are expressible via `seed_words`.
+- `DetachedGates` in the Python adapter delegates `fixed_vertices` calculation to Python and routes to `BoundaryReallocation`, because the core `detached_gates_refine` entry point segfaults on hyperedges with no gate vertices (such as degenerate hyperedges containing only qubit vertices).
 
 ### Hash-seed exactness (PYTHONHASHSEED)
 
@@ -196,9 +228,27 @@ As a result, when `PYTHONHASHSEED` is set (e.g. `0`, `1`, `42`), the C++ core an
 ## Prerequisites
 
 - CMake >= 3.20 and a C++20 compiler (GCC >= 12 or Clang >= 16).
-- Python 3.11. The project venv at `.venv/` already contains the reference `pytket_dqc` and `networkx` (the oracle).
+- Python 3.11 with [uv](https://github.com/astral-sh/uv). The project virtual environment at `.venv/` can be synced using `uv sync` (locked in `uv.lock`). It contains `pytest`, `kahypar`, `pyzx`, and the reference `pytket_dqc` and `networkx` packages (the test oracles).
 - Network access on the **first** configure only (CMake fetches Catch2 and pybind11).
 - For the KaHyPar-backed `HypergraphPartitioning` allocator: the KaHyPar source tree (default `/home/ubuntu/kahypar`) and Boost (`libboost_program_options`). If `DQC_KAHYPAR_SOURCE_DIR` does not contain `lib/libkahypar.cc`, the allocator is skipped (the `_core.hypergraph_partitioning_*` functions and the KaHyPar tests are compiled out).
+
+## Quickstart: Unified Verification Runner
+
+To run the complete verification suite across all active tiers in a single command, run from the repository root:
+
+```bash
+./tests/python/run_gates.sh
+```
+
+This gate script automatically:
+
+1. Builds the C++ core with Python bindings enabled (`-DDQC_BUILD_BINDINGS=ON`).
+2. Runs all 89 native C++ Catch2 tests (`ctest --test-dir build --output-on-failure`).
+3. Runs the fast Python test suite via pytest (`151 passed, 7 skipped`).
+4. Runs the core differential equivalence sweep across 4 hash seeds (`check_equivalence.py`).
+5. Runs the adapter differential equivalence sweep across 4 hash seeds (`check_adapter_equivalence.py`, 894 checks/seed, 0 skips).
+
+---
 
 ## 1. Build and run the C++ unit tests
 
@@ -212,7 +262,7 @@ ctest --test-dir build --output-on-failure
 
 These are the native Catch2 tests in `cpp/tests/`:
 
-- `test_rng.cpp` — `PyRandom` is bit-exact against CPython `random` (golden vectors for seeds `0, 1, 12345, 2^32, 2^32+1, 2^63+5, 2^64`).
+- `test_rng.cpp` — `PyRandom` is bit-exact against CPython `random` (golden vectors for seeds `0, 1, 12345, 2^32, 2^32+1, 2^63+5, 2^64`), verifies non-deterministic unseeded initialization via OS entropy, and verifies exact 625-word MT19937 `get_state` / `set_state` round-tripping.
 - `test_hypergraph.cpp` — hypergraph add/remove/merge/split/boundary, `is_valid`, `is_placement`.
 - `test_graph.cpp` — `steiner_tree`, `direct_from_origin`, Dijkstra vs networkx 3.6.1 golden vectors; node/edge iteration order, weights, self-loops, `degree`, `remove_node`, `subgraph`, `edge_subgraph`.
 - `test_gateset.cpp` — `to_euler_with_two_hadamards` (all branch cases + error cases).
@@ -222,8 +272,13 @@ These are the native Catch2 tests in `cpp/tests/`:
 - `test_distribution.cpp` — `cost`, `is_valid`, `non_local_gate_list/count`, `detached_gate_list/count`.
 - `test_network.cpp` — `NISQNetwork` construction, accessors, validation errors, graph structure, equality.
 - `test_composition.cpp` — `RepeatRefiner` / `SequenceRefiner` do-while / or-fold semantics and nesting.
+- `test_to_pytket_circuit.cpp` — circuit emission to pytket `Circuit`, gate translation, ebit memory validation, and constraint error triggers.
 - `test_hypergraph_partitioning.cpp` — KaHyPar placement validity, capacity, determinism, `can_implement` error (only built when KaHyPar is available).
-- `test_bipartite.cpp`, `test_pyset.cpp`, `test_circuit_analysis.cpp`, `test_placement.cpp`, `test_hypergraph_circuit.cpp` — as before.
+- `test_bipartite.cpp` — bipartite graph coloring, independent sets, Hopcroft-Karp matching, and minimum vertex cover.
+- `test_pyset.cpp` — `PySet` probe sequences, dummy-slot reuse, resize policy, reproducing CPython `set` iteration order.
+- `test_circuit_analysis.cpp` — command inspection, ebit cost/memory requirements, CU1 locality checks.
+- `test_placement.cpp` — `Placement` mapping validity, server assignment, serialization.
+- `test_hypergraph_circuit.cpp` — hypergraph circuit construction, gate indexing, boundary tracking.
 
 ## 2. Build the Python bindings
 
@@ -260,7 +315,7 @@ Each section prints `OK` and the script exits non-zero on the first mismatch. It
 - `Distribution` — `cost`, `is_valid`, `non_local_gate_list/count`, `detached_gate_list/count`.
 - `PacMan` — all packet internals: navigation helpers, `are_neighbouring/hoppable`, connected/containing/split packets, embedded packets, `get_hopping_packets_within`, conflicts.
 - Allocators (`Random` seeded, `Ordered`, `Brute`) and all refiners (`VertexCover`, `EagerHTypeMerge`, `Neighbouring/IntertwinedDTypeMerge`, `BoundaryReallocation`, `DetachedGates`). Each `_core` allocator returns a full `Distribution` (placement + cost + validity) compared against the reference `Distribution`.
-- `Annealing` — `acceptance_criterion` exactly, and the **full `allocate` loop bit-exactly** via the seeded-initial-placement workaround: passing an `initial_place_method` that wraps `Random` with a fixed seed (so the initial placement no longer discards the seed) makes the reference deterministic, and the C++ `annealing_allocate(dist_circ, network, ..., initial_place_seed=SEED)` reproduces it bit-for-bit (placement + final cost).
+- `Annealing` — the core's `acceptance_criterion` matches the reference helper exactly, and `annealing_allocate` reproduces the **full reference `allocate` loop bit-exactly** via the seeded-initial-placement workaround: passing an `initial_place_method` that wraps `Random` with a fixed seed (so the initial placement no longer discards the seed) makes the reference deterministic, and the C++ `annealing_allocate(dist_circ, network, ..., initial_place_seed=SEED)` reproduces it bit-for-bit (placement + final cost).
 - `NISQNetwork` vs `pytket_dqc.networks.NISQNetwork` — accessors, `to_dict`/`from_dict` round-trip, graph structure, validation errors.
 - `HypergraphPartitioning` vs `pytket_dqc.allocators.HypergraphPartitioning` — **bit-identical placements** (KaHyPar initial partition + `make_valid`) for QFT circuits across partition counts and seeds.
 - `RepeatRefiner` / `SequenceRefiner` — the `_core` classes reproduce the manual do-while / or-fold loops already validated by the other sections.
@@ -273,7 +328,7 @@ Each section prints `OK` and the script exits non-zero on the first mismatch. It
 
 ## 4. QFT benchmark differential test
 
-The four benchmark drivers in `tests/python/qft/` run the same QFT workloads through the reference Python package (`main_few_qpus_py.py`, `main_many_qpus_py.py`) and through the C++ core (`main_few_qpus_cpp.py`, `main_many_qpus_cpp.py`). They write their results to `tests/python/qft/results_few_qpus_py/`, `results_few_qpus_cpp/`, `results_many_qpus_py/` and `results_many_qpus_cpp/`; the two `plot_*.py` scripts turn each variant's results into bar charts (pass `--cpp` to plot the C++ variant).
+The four benchmark drivers in `tests/python/qft/` run the same QFT workloads through the reference Python package (`main_few_qpus_py.py`, `main_many_qpus_py.py`) and through the C++ adapter package (`main_few_qpus_cpp.py`, `main_many_qpus_cpp.py` using `pytket_dqc_cpp`). They write their results to `tests/python/qft/results_few_qpus_py/`, `results_few_qpus_cpp/`, `results_many_qpus_py/` and `results_many_qpus_cpp/`; the two `plot_*.py` scripts turn each variant's results into bar charts (pass `--cpp` to plot the C++ variant).
 
 ```bash
 .venv/bin/python3 tests/python/check_qft_equivalence.py
@@ -281,18 +336,45 @@ The four benchmark drivers in `tests/python/qft/` run the same QFT workloads thr
 
 The checker runs all four drivers under `PYTHONHASHSEED=12345` (override with `QFT_PYTHONHASHSEED`), compares the result files field by field **ignoring the two timing lines**, regenerates the plots for both variants, and exits non-zero if anything differs. Use `--skip-computation` to reuse the existing result files (the plots and the comparison still run), and `--skip-plots` to skip plotting. The generated `.txt`/`.png` files are gitignored.
 
-### 5. Adapter suite: vendored upstream tests
+## 5. Adapter suite: vendored & regression tests
 
 The upstream tests and fixtures from commit `1ac175e` are vendored into `tests/`
 (`tests/*_test.py`, `tests/test_circuits/`) with only the import root rewritten to
-`pytket_dqc_cpp`. Run them **from the repository root** (the fixtures are opened
-through paths relative to the root) with the project venv, which has `pytest`,
-`kahypar`, `pyzx` and the reference package installed:
+`pytket_dqc_cpp`. In addition, `tests/` contains adapter-specific regression suites:
+
+- `tests/rng_semantics_test.py` — validates `PyRandom` seeding/entropy behaviour, that `Random`, the refiners and `Annealing` leave Python's ambient `random` stream where the reference does (625-word state round-trip), and seeded parity.
+- `tests/error_parity_test.py` — validates strict `ConstraintException` API parity (`.server`, `.v_gate`, guidance hints) against upstream.
+
+Run the test suite **from the repository root** (fixtures are opened relative to the root) with the project venv:
 
 ```bash
 PYTHONPATH=python .venv/bin/python -m pytest tests -m "not high_compute"
 PYTHONPATH=python .venv/bin/python -m pytest tests -m high_compute   # slow, optional
 ```
+
+The fast run executes 158 tests: 151 pass and 7 are skipped (matching the exact 7 upstream skips documented in `tests/README.md`).
+
+### Skipped vs deselected (the `151 passed, 7 skipped, 7 deselected` line)
+
+`pytest tests -m "not high_compute"` collects 165 tests and leaves 14 of them unrun,
+in two **disjoint** groups:
+
+- **7 skipped** — unconditional `@pytest.mark.skip(reason=...)` decorators copied
+  verbatim from upstream (CX / `QControlBox` / teleportation / removed-function /
+  drawing-era features that are disabled upstream too). They are listed in
+  `tests/README.md` and can never run without editing the source.
+- **7 deselected** — tests marked `@pytest.mark.high_compute` and filtered out by
+  the `-m "not high_compute"` expression *before* selection, so they are not run at
+  all: `test_to_pytket_circuit_with_pauli_circ`,
+  `test_to_pytket_circuit_pr78_bug`, `test_embedding_detached`
+  (`tests/circuits_test.py`) and `test_vertex_cover_refiner_pauli_circ`,
+  `test_vertex_cover_refiner_random_circ`, `test_vertex_cover_embedding_boundary_failure`,
+  `test_boundary_reallocation_refiner_pauli_circ` (`tests/refiner_test.py`). These are
+  valid heavyweight integration tests (10-qubit fixtures, KaHyPar + refiners, and a
+  PyZX `check_equivalence` round-trip); run them with `-m high_compute`.
+
+So `151 + 7 + 7 = 165`: the fast gate never exercises the `high_compute` group, and
+a regression there is only caught by the optional slow run.
 
 `pytest.ini` pins `testpaths = tests`, `python_files = *_test.py test_*.py` (so the
 `tests/python/check_*.py` differential scripts are never collected) and declares the
@@ -303,7 +385,7 @@ Differences from upstream: `test_nisq_draw` is removed (drawing is out of scope)
 and `test_kahypar_install` loads the INI from `pytket_dqc_cpp/allocators/`
 (`importlib_resources` is no longer needed).
 
-### 6. Adapter differential check
+## 6. Adapter differential check
 
 `tests/python/check_adapter_equivalence.py` compares `pytket_dqc_cpp` against
 `pytket_dqc` object by object. Run it from the repository root:
@@ -312,17 +394,22 @@ and `test_kahypar_install` loads the INI from `pytket_dqc_cpp/allocators/`
 PYTHONPATH=python .venv/bin/python tests/python/check_adapter_equivalence.py
 ```
 
+The script automatically executes a 4-seed sweep across `HASH_SEEDS` (`0, 1, 42, 12345`), running **894 checks per seed** (3,576 checks total) with a strict zero-skip gate (`SKIPPED[0] == 0`). Ambient `PYTHONHASHSEED` will not bypass the sweep; to run a single seed explicitly, set `DQC_ADAPTER_SINGLE_SEED=1`:
+
+```bash
+DQC_ADAPTER_SINGLE_SEED=1 PYTHONHASHSEED=7 PYTHONPATH=python .venv/bin/python tests/python/check_adapter_equivalence.py
+```
+
 It covers `HypergraphCircuit` vertices/hyperedges/serialisation, `Distribution.cost`,
 `Random`/`Ordered`/`Brute` placements, seeded `Annealing` (`initial_place_method=Ordered()`),
 refiner booleans + hyperedge lists + placements + costs, `PacMan` packet dictionaries,
-`GainManager` occupancy/cost maps/move gains, `to_pytket_circuit` commands/qubits/params,
-and a lazy-import check for `pytket_dqc`. Like `check_equivalence.py` it re-executes itself
-once per seed in `HASH_SEEDS` (`0, 1, 42, 12345`) when `PYTHONHASHSEED` is unset.
+`GainManager` occupancy/cost maps/move gains, graph tools (`steiner_tree` edge metadata),
+`to_pytket_circuit` commands/qubits/params, ambient RNG parity (`random.getstate()` after each random-consuming call), and a lazy-import check for `pytket_dqc`.
 
-### 7. (Optional) Upstream pytest suite as an oracle
+## 7. (Optional) Upstream pytest suite as an oracle
 
 The original, unmodified upstream tests can also be run against the reference
-package to sanity-check the environment:
+package to sanity-check the environment:151 passed, 7 skipped, 7 deselected
 
 ```bash
 .venv/bin/python3 -m pytest <path-to-upstream-tests> -m "not high_compute"

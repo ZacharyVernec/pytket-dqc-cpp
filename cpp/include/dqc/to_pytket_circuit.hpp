@@ -348,7 +348,8 @@ struct LinkManager {
         throw ConstraintException(
             "Communication memory capacity of server " +
                 std::to_string(server) +
-                " exceeded.\n\tConsider setting allow_update to True.",
+                " exceeded. \n\tConsider setting allow_update to True: "
+                "\n\tto_pytket_circuit(allow_update=True)",
             server);
       }
     }
@@ -895,9 +896,12 @@ inline std::optional<Hyperedge> split_for_bound(Distribution& dist,
       if (cap < 2) {
         throw ConstraintException(
             "Could not implement the gate " + std::to_string(e.v_gate) +
-                " since it is placed on a non-home server " +
+                " sinceit is placed on a non-home server " +
                 std::to_string(placed_server) +
-                " and said server has memory capacity less than two.",
+                " and said server has memory capacity less than two. "
+                "Consider using an approach that does not produce evicted gates, "
+                "or increase the communication memory of server " +
+                std::to_string(placed_server) + ".",
             placed_server);
       }
     }

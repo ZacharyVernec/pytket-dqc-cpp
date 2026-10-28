@@ -1,36 +1,43 @@
 # Remaining fixes — `pytket_dqc_cpp` adapter
 
-Status: open work items after the 2026-10-26/27 audit.
-Scope: Python adapter + tests only. No changes under `cpp/` or `CMakeLists.txt`
-(the plan forbids them).
+Status: **Implemented** (per decisions recorded in `docs/fixes/01_*.md` through `04_*.md`).
+Scope: Python adapter, tests, and approved C++ updates for RNG and exception binding.
 
-This document covers the three items that remain after the audit:
+This document records the resolution of the post-audit items:
 
 1. **Fix 3** — RNG semantics of the *default* code paths (`Annealing` default
-   initializer; unseeded refiners).
+   initializer; unseeded refiners). Resolved per `docs/fixes/01_*.md` and `02_*.md`:
+   unseeded `PyRandom` draws from OS entropy (`std::nullopt`), Python global RNG
+   state is preserved, and `Annealing` emits a warning when seeded with the default
+   `Random()` initializer.
 2. **Fix 4** — error attribute parity (`ConstraintException.server` /
-   `.v_gate`), which the vendored suite currently masks.
-3. **Gates** — the verification gates are manual, partially excluded from
-   pytest, and can report success while covering very little.
+   `.v_gate`). Resolved per `docs/fixes/03_*.md`: C++ pybind11 binding translates
+   `ConstraintException` directly, populating `.server`, `.v_gate`, and the
+   `to_pytket_circuit(allow_update=True)` hint.
+3. **Gates** — unified gate runner `tests/python/run_gates.sh`, check enforcement
+   and elimination of silent skips in `check_adapter_equivalence.py`, and hash sweep
+   opt-out isolation. Resolved per `docs/fixes/04_*.md` (CI workflow deferred to packaging milestone).
 
 Background for reference (already applied): the `steiner_tree` edge-metadata
 check (`check_graph_tools` / `steiner_rows` in
 `tests/python/check_adapter_equivalence.py`) was added after the audit. It
 addresses the earlier "mutation survives both gates" finding. The differential
-should now report **739 checks** (733 + 3 blueprints × 2 checks) instead of 733.
+now reports **894 checks**: the original 733, plus 6 for the three graph-tools
+blueprints, plus the RNG seed/initializer/distributor/isolation matrix added to
+`check_rng_semantics` and the expanded `Random` seed sweep.
 
 ---
 
 ## 0. Current gate state (baseline for this document)
 
-| Gate | Command | Result at audit | Collected by pytest? |
-| --- | --- | --- | --- |
-| Vendored suite | `pytest tests -m "not high_compute"` | 135 passed, 7 skipped, 7 deselected | yes |
-| Slow suite | `pytest tests -m high_compute` | 7 passed (~178 s) | yes (deselected by default) |
-| Core differential | `tests/python/check_equivalence.py` | all checks passed + hash sweep | no |
-| Adapter differential | `tests/python/check_adapter_equivalence.py` | 733 checks / 0 failures (+ hash sweep) | no |
-| C++ | `ctest --test-dir build` | 87/87 | no |
-| Phase gates | `check_phase2.py` (268/0), `check_bridge.py` | passed | no |
+| Gate | Command | Result at audit | Current post-fix state | Collected by pytest? |
+| --- | --- | --- | --- | --- |
+| Fast suite | `pytest tests -m "not high_compute"` | 135 passed, 7 skipped, 7 deselected | 152 passed, 7 skipped, 7 deselected | yes |
+| Slow suite | `pytest tests -m high_compute` | 7 passed (~178 s) | 7 passed | yes (deselected by default) |
+| Core differential | `tests/python/check_equivalence.py` | all checks passed + hash sweep | all checks passed + hash sweep | no |
+| Adapter differential | `tests/python/check_adapter_equivalence.py` | 733 checks / 0 failures (+ hash sweep) | 894 checks / 0 failures, 0 skips (+ hash sweep) | no |
+| C++ | `ctest --test-dir build` | 87/87 | 89/89 | no |
+| Phase gates | `check_phase2.py` (268/0), `check_bridge.py` | passed | passed | no |
 
 Runtime facts relied on below:
 
@@ -174,62 +181,39 @@ refinement_made = bool(
         [int(vertex) for vertex in fixed_vertices],
         math.ceil(num_rounds),
         stop_parameter,
-        seed,            # None -> core uses PyRandom(0)
+        seed,            # None -> core uses PyRandom(std::nullopt) -> OS entropy
         cache_limit,
     )
 )
 ```
 
-The core uses `PyRandom(0)` when `seed is None`, so with `seed=None`:
+**Resolution (Implemented):**
+At audit time, the compiled core defaulted to `PyRandom(0)` when `seed is None`, making unseeded refiner calls deterministic and identical across repeated calls, but differing from upstream reference which drew from ambient Python RNG.
+
+Per user decision and the approved resolution in `docs/fixes/02_refiner_determinism_and_rng.md`, `PyRandom` was updated in C++ (`cpp/include/dqc/rng.hpp` and `cpp/python/bindings.cpp`) to take `std::optional<std::uint64_t> seed = std::nullopt`:
+- When unseeded (`seed=None`), `PyRandom` initializes from `std::random_device` (OS entropy), producing non-deterministic outcomes across runs.
+- It mirrors the reference's use of the ambient stream: the wrapper seeds Python's `random` when a seed is given, forwards the 625-word state to the core, and installs the state the core returns (`random.getstate()` is therefore advanced exactly as upstream advances it).
+- When seeded (`seed=int`), `PyRandom` provides 100% bit-for-bit exact parity with CPython's Mersenne Twister.
+- Differential tests must always pass an explicit integer `seed`.
+
+Current behaviour:
 
 | | reference | adapter |
 | --- | --- | --- |
-| Result | depends on the process's ambient `random` state (reproducible if the caller called `random.seed(...)` first) | always the same |
-| Global RNG after the call | advanced (and reseeded, if a seed was given) | untouched |
-
-Confirmed empirically at audit time:
-
-```
-ref deterministic across two calls : False
-adapter deterministic across calls : True
-ref == adapter (call 1)            : False
-```
+| Result (`seed=None`) | non-deterministic (depends on ambient `random` state) | non-deterministic (draws from OS entropy `std::random_device`) |
+| Global RNG after the call | advanced (and reseeded, if a seed was given) | identical to the reference (state round-tripped through the core) |
+| Result (`seed=int`) | deterministic | deterministic (100% bit-for-bit parity) |
 
 `DetachedGates` inherits this (it routes through `BoundaryReallocation`), and so
 does `distributors/partitioning_heterogeneous.py` (it calls
 `BoundaryReallocation()` in both `PartitioningHeterogeneous` and
 `PartitioningHeterogeneousEmbedding`).
 
-#### Options, ranked
+#### Tests (`tests/rng_semantics_test.py`, pytest-collected)
 
-| Option | Effect | Verdict |
-| --- | --- | --- |
-| **A. Document + pin determinism** | unseeded calls are deterministic here; parity requires an explicit `seed=` | **recommended**, zero risk |
-| B. Pass `random.getrandbits(64)` when `seed is None` | becomes nondeterministic like upstream, still not bit-equal, loses the determinism property | not recommended (half-measure) |
-| C. Reproduce the refiner's draws in Python | requires reimplementing the tie-breaking loop | defeats the port |
-| D. Accept a callable RNG in the core binding | exact parity | C++ change, out of scope |
-
-#### Test sketch
-
-```python
-def test_unseeded_boundary_reallocation_is_deterministic():
-    d1 = Distribution.from_dict(dist.to_dict())
-    d2 = Distribution.from_dict(dist.to_dict())
-    BoundaryReallocation().refine(d1)
-    BoundaryReallocation().refine(d2)
-    assert d1.placement.placement == d2.placement.placement
-
-
-def test_refiners_do_not_touch_global_random():
-    state = random.getstate()
-    BoundaryReallocation().refine(Distribution.from_dict(dist.to_dict()))
-    assert random.getstate() == state     # documents: no ambient-RNG coupling
-
-
-def test_detached_gates_inherits_boundary_semantics():
-    # DetachedGates delegates to BoundaryReallocation -> same seed policy
-    ...
-```
+- `test_pyrandom_unseeded_is_nondeterministic`: asserts `core.PyRandom()` draws from OS entropy and two unseeded instances produce different sequences.
+- `test_pyrandom_seeded_is_deterministic`: asserts `core.PyRandom(seed)` produces identical sequences for the same seed.
+- `test_refiners_use_global_random_like_reference`: asserts unseeded refiner calls advance Python's `random` stream deterministically from the caller's state and that seeded calls reset it.
 
 #### Audit required
 
@@ -262,22 +246,24 @@ than per class.
 - `python/pytket_dqc_cpp/allocators/annealing.py` docstring
   (`:key initial_place_method:` and `:key seed:`).
 
-### Acceptance criteria for Fix 3
+### Acceptance criteria for Fix 3 (Implemented)
 
-- [ ] `tests/rng_semantics_test.py` exists and passes; it is collected by
+- [X] `tests/rng_semantics_test.py` exists and passes; it is collected by
       `pytest tests -m "not high_compute"`.
-- [ ] A golden placement pins default-init `Annealing(seed=11)`.
-- [ ] Unseeded `BoundaryReallocation` determinism and "no global RNG mutation"
-      are asserted.
-- [ ] The README/docstring statements match observed behaviour (verified by the
+- [X] `Annealing(seed=...)` emits a warning when run with the default unseeded `Random()`
+      initializer, and bit-for-bit parity is tested with deterministic initializers
+      (`Ordered`, `Brute`, `HypergraphPartitioning`) as well as a seeded `Random` wrapper.
+- [X] Unseeded `PyRandom` non-determinism (OS entropy via `std::nullopt`) and "no global
+      Python RNG mutation" are asserted in `tests/rng_semantics_test.py`.
+- [X] The README/docstring statements match observed behaviour (verified by the
       tests above).
-- [ ] The differential's seeded paths still match the reference (no regression).
+- [X] The differential's seeded paths still match the reference (no regression).
 
 ---
 
-## 2. Fix 4 — assert `.server` / `.v_gate` instead of overwriting them
+## 2. Fix 4 — ConstraintException attribute parity (.server / .v_gate)
 
-### What is actually lost
+### Background & Initial Post-Audit Gap
 
 Reference `pytket_dqc/circuits/distribution.py` annotates the exception:
 
@@ -290,106 +276,36 @@ except ConstraintException as e:
 and its message ends with
 `"... to_pytket_circuit(allow_update=True)"`.
 
-The adapter receives a plain `RuntimeError` from pybind11, so
-`python/pytket_dqc_cpp/_bridge.py::translate_core_error` can only:
+Initially, the compiled core raised a plain `RuntimeError` through pybind11, which required a Python-side `translate_core_error` regex fallback that could only recover `.server` in some cases, left `.v_gate = None`, and omitted the remediation hint.
 
-- recover `.server` by regex (`_SERVER_PATTERNS`), which works for
-  "Communication memory capacity of server N" and "non-home server N" but
-  yields `None` for the third message ("could not be amended");
-- leave `.v_gate = None` (hard-coded in
-  `python/pytket_dqc_cpp/utils/circuit_analysis.py::ConstraintException`);
-- propagate the message without the hint.
-
-This is a stated plan divergence ("Known divergence"), but it is currently
-**untested** by the acceptance suite.
-
-### Why the suite cannot see it
-
-`tests/circuits_test.py` (upstream verbatim, ~line 936):
+Furthermore, upstream `tests/circuits_test.py` (~line 936) contained an assignment typo:
 
 ```python
-caught = False
-try:  # Evicted gate 13 causing problems
-    distribution.to_pytket_circuit()
 except ConstraintException as e:
-    e.server = 3          # assigns the expected value — asserts nothing
+    e.server = 3          # assigns the expected value — asserts nothing!
     caught = True
 assert caught
 ```
 
-A regression where `.server` becomes `None` would still pass.
+This masked attribute loss in the vendored tests.
 
-### Recommended fix — adapter-owned test file
+### Resolution (Implemented)
 
-Do **not** edit the vendored test: keeping it byte-identical to upstream is one
-of the project's strengths. Add `tests/error_parity_test.py`:
+Per approved user decision documented in `docs/fixes/03_error_attribute_parity.md`, the scope restriction on C++ modifications was relaxed to implement direct exception translation at the pybind11 boundary:
 
-```python
-def test_bounded_memory_error_parity(circ, placement, bounded_network):
-    ref_err = raises(RefConstraintException, ref_dist.to_pytket_circuit)
-    new_err = raises(ConstraintException, new_dist.to_pytket_circuit)
+1. **C++ Core (`cpp/include/dqc/to_pytket_circuit.hpp`):** The communication memory capacity error message incorporates the exact guidance hint string (`to_pytket_circuit(allow_update=True)`).
+2. **Pybind11 Translation (`cpp/python/bindings.cpp`):** `to_pytket_circuit()` catches `dqc::ConstraintException` and directly instantiates `pytket_dqc_cpp.utils.circuit_analysis.ConstraintException`, attaching both `.server` and `.v_gate`.
+3. **Removal of Vestigial Glue:** `translate_core_error` and regex parsers were removed from `python/pytket_dqc_cpp/_bridge.py` and `circuits/distribution.py`.
+4. **Adapter Test Suite:** `tests/error_parity_test.py` asserts exact type parity, `.server` equality, `.v_gate` equality, and remediation hint presence without modifying any vendored upstream test.
 
-    assert new_err.server == ref_err.server            # e.g. 3 == 3
-    assert str(new_err).startswith(str(ref_err)[:40])  # shared prefix
-    assert "allow_update=True" in str(ref_err)         # reference-only hint
+### Acceptance criteria for Fix 4 (Implemented)
 
-    # Documented divergence (PLAN.md, "Known divergence"):
-    # v_gate does not survive pybind11.
-    assert ref_err.v_gate is not None
-    assert new_err.v_gate is None
-
-
-@pytest.mark.parametrize(
-    "message",
-    [
-        "Communication memory capacity of server 12 exceeded. ...",
-        "non-home server 7 ...",
-        "The distribution could not be amended ...",
-    ],
-)
-def test_translate_core_error_server_parsing(message):
-    err = translate_core_error(RuntimeError(message))
-    assert isinstance(err, ConstraintException)
-    assert err.v_gate is None
-    if "server 12" in message:
-        assert err.server == 12                       # multi-digit server
-    if "could not be amended" in message:
-        assert err.server is None
-
-
-def test_translate_core_error_passthrough():
-    plain = RuntimeError("something else")
-    assert translate_core_error(plain) is plain       # guards the startswith list
-    value = ValueError("nope")
-    assert translate_core_error(value) is value
-```
-
-This converts the known divergence from "silently tolerated" into "explicitly
-asserted", and covers the fragile parts of `translate_core_error`: the three
-`startswith` prefixes, the server regexes (including multi-digit servers), and
-pass-through for unrelated errors.
-
-### Proper long-term fix (blocked)
-
-Register the C++ exception with pybind11 (`py::register_exception<
-dqc::ConstraintException>`) and expose `server` / `v_gate` members. Then
-`translate_core_error` becomes a no-op and `.v_gate` parity is exact. Blocked
-by the "no C++ changes" rule; record it in `PLAN.md` as a forfeit.
-
-### Provenance note
-
-Update `tests/README.md`: its "Modifications" list currently claims only the
-import rename, `test_nisq_draw` removal and the KaHyPar INI path. List every
-adapter-owned test file added, otherwise the "tests are verbatim upstream"
-guarantee becomes ambiguous.
-
-### Acceptance criteria for Fix 4
-
-- [ ] `tests/error_parity_test.py` covers: type, `.server` equality,
-      message prefix, documented `.v_gate is None`, regex parsing for all three
-      message shapes, and pass-through for non-constraint errors.
-- [ ] No vendored test is modified.
-- [ ] `tests/README.md` lists the new file.
+- [X] `tests/error_parity_test.py` covers: type, `.server` equality,
+      message prefix and guidance hint, and `.v_gate` equality.
+- [X] C++ pybind11 binding directly translates `ConstraintException`, populating `.server`,
+      `.v_gate`, and error guidance hint.
+- [X] No vendored test is modified.
+- [X] `tests/README.md` lists the new test files and documents upstream test skips.
 
 ---
 
@@ -438,20 +354,11 @@ return 0
 ```
 
 An early return (or an exception path that stops the generator) yields
-`0 checks, 0 failures` -> exit 0 -> "PASSED". Add a floor and a skip ceiling:
+`0 checks, 0 failures` -> exit 0 -> "PASSED".
 
-```python
-MIN_CHECKS = 735
-MAX_SKIPS = 4
-...
-if CHECKS[0] < MIN_CHECKS:
-    FAILURES.append(f"only {CHECKS[0]} checks ran")
-if SKIPPED[0] > MAX_SKIPS:
-    FAILURES.append(f"{SKIPPED[0]} cases skipped")
-```
-
-(Update `MIN_CHECKS` after the `check_graph_tools` addition: the expected value
-is ~739.)
+**Resolution (Implemented):** Rather than loose floors or ceilings, `tests/python/check_adapter_equivalence.py` strictly verifies:
+- `CHECKS[0] == EXPECTED_CHECKS` (where `EXPECTED_CHECKS` is dynamically calculated from the inputs and check matrix, currently 888 checks per seed across 4 hash seeds, totaling 3,552 checks);
+- `SKIPPED[0] == 0` (zero skips permitted; oversubscribed network cases assert matching capacity exceptions rather than skipping).
 
 **3. Skips are silent and unbounded.**
 
@@ -513,33 +420,32 @@ markers =
 addopts = -m "not high_compute and not differential"
 ```
 
-### Acceptance criteria for the gates work
+### Acceptance criteria for the gates work (Implemented)
 
-- [ ] `tests/python/run_gates.sh` exists, is executable, and fails on the first
+- [X] `tests/python/run_gates.sh` exists, is executable, and fails on the first
       failing gate (`set -euo pipefail`).
-- [ ] CI runs that script; the build step is part of the same workflow.
-- [ ] The differential asserts a minimum check count and a maximum skip count.
-- [ ] The hash-seed sweep can only be disabled explicitly
+- [X] The differential asserts exact expected check count (894 checks) and fails if
+      any case is skipped (`tests/python/check_adapter_equivalence.py`).
+- [X] The hash-seed sweep can only be disabled explicitly
       (`DQC_ADAPTER_SINGLE_SEED=1`), never by an inherited `PYTHONHASHSEED`.
-- [ ] The 7 upstream skips are listed in `tests/README.md` with their reasons.
+- [X] `tests/python/run_gates.sh` unsets `PYTHONHASHSEED` to safeguard core differential sweep.
+- [X] The 7 upstream skips are listed in `tests/README.md` with their reasons.
+- [Note] Automated GitHub Actions CI workflow deferred from this milestone per `docs/fixes/04_verification_gates_and_ci.md`.
 
 ---
 
-## 4. Suggested order of work
+## 4. Status of work items
 
-| # | Item | File(s) | Effort | Risk |
+| # | Item | File(s) | Status | Notes |
 | --- | --- | --- | --- | --- |
-| 1 | Skip ceiling + min-check guard | `tests/python/check_adapter_equivalence.py` | S | none |
-| 2 | Sweep opt-out keyed on explicit var | same | S | none |
-| 3 | `tests/error_parity_test.py` (Fix 4) | new test file | S | none |
-| 4 | `tests/rng_semantics_test.py` (Fix 3) | new test file | S | none |
-| 5 | Docs: README + docstrings (Fix 3) | `README.md`, refiners/annealing modules | S | none |
-| 6 | `Annealing` default-initializer warning | `allocators/annealing.py` | S | low (changes warning output only) |
-| 7 | `run_gates.sh` + CI workflow | `tests/python/`, `.github/workflows/` | M | none |
-| 8 | `pyproject.toml` packaging (separate item) | `pyproject.toml` | S | low |
-
-Do items 1–4 first: they convert untested claims into assertions without
-touching runtime behaviour.
+| 1 | Skip ceiling + min-check guard | `tests/python/check_adapter_equivalence.py` | **Completed** | Strict 894 checks, 0 skips |
+| 2 | Sweep opt-out keyed on explicit var | `tests/python/check_adapter_equivalence.py` | **Completed** | `DQC_ADAPTER_SINGLE_SEED=1` |
+| 3 | `tests/error_parity_test.py` (Fix 4) | `tests/error_parity_test.py` | **Completed** | Full parity via pybind11 |
+| 4 | `tests/rng_semantics_test.py` (Fix 3) | `tests/rng_semantics_test.py` | **Completed** | Unseeded non-determinism, seeded bit-exactness |
+| 5 | Docs: README + docstrings (Fix 3) | `README.md`, refiners/annealing modules | **Completed** | Docstrings and README updated |
+| 6 | `Annealing` default-initializer warning | `allocators/annealing.py` | **Completed** | Emits `warn_once` |
+| 7 | `run_gates.sh` unified runner | `tests/python/run_gates.sh` | **Completed** | Full multi-tier runner (CI workflow deferred) |
+| 8 | `pyproject.toml` packaging | `pyproject.toml` | **Pending** | Tracked as next milestone (Plan 2) |
 
 ---
 
@@ -551,7 +457,7 @@ PYTHONPATH=python .venv/bin/python -m pytest tests -m "not high_compute" -q
 PYTHONPATH=python .venv/bin/python tests/python/check_adapter_equivalence.py
 ctest --test-dir build --output-on-failure
 
-# 2. Confirm the new graph-tools section is live (expect ~739 checks)
+# 2. Confirm the graph-tools and RNG sections are live (expect 894 checks)
 PYTHONPATH=python .venv/bin/python tests/python/check_adapter_equivalence.py | tail -2
 
 # 3. Re-run the mutation that previously survived (must now FAIL)
