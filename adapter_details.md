@@ -152,6 +152,15 @@ In `pytket_dqc_cpp`:
   - **Self-Reproducibility:** Passing a custom seeded `Random` wrapper (e.g. `class SeededRandom(Random): ...`) produces reproducible runs within `pytket_dqc_cpp`.
   - **Default `Random()`:** Reseeds from OS entropy on both sides; non-deterministic.
 
+### 4.5 Hash-Seed Exactness & CPython Set Iteration Parity (PYTHONHASHSEED)
+The reference (`pytket_dqc` + `networkx`) orders sets of `Packet` / `MergedPacket` / `HoppingPacket` objects by their CPython hash, where `Packet.__hash__ == hash("P<i>")` is a SipHash keyed by the `PYTHONHASHSEED`-derived secret. The C++ core reproduces this exactly:
+
+- `dqc::hash.hpp` implements SipHash-1-3 plus the CPython `PYTHONHASHSEED` secret derivation (`lcg_urandom`), and CPython `int`/`tuple`/`frozenset`/`str` hashing (including the `-1 → -2` normalisation).
+- `dqc::py_set.hpp` (`PySet`) reproduces CPython `set`'s hash-table layout — probe sequences, dummy-slot reuse ("last dummy wins"), and resize policy — so set iteration order matches CPython bit-for-bit.
+- `dqc::bipartite.hpp` reproduces `networkx`'s `connected_components` (BFS), `bipartite.color`/`sets`, `hopcroft_karp_matching`, `to_vertex_cover` (König), and `G.subgraph` view node ordering, so the vertex-cover refiner chooses the *same* minimum cover as the reference.
+
+As a result, when `PYTHONHASHSEED` is set (e.g. `0`, `1`, `42`), the C++ core and the reference produce **identical** results, including which minimum vertex cover is selected and the resulting placement/hypergraph. When `PYTHONHASHSEED` is unset, both the reference and the C++ core draw independent random hash secrets, so their (individually deterministic-per-process) set orderings differ — exactly as two separate runs of the reference would.
+
 ---
 
 ## 5. Constraint Exceptions & Error Parity
@@ -182,7 +191,11 @@ Because of this typo, upstream tests passed green even if `.server` was missing.
 
 ## 6. Verification Architecture & Multi-Tier Gates
 
-Verification is structured across five distinct tiers to guarantee both internal correctness and cross-package equivalence.
+Verification is structured across five distinct tiers to guarantee both internal correctness and cross-package equivalence:
+- **Unit (C++)**: Catch2 tests mirroring the upstream `tests/` suite, feeding data directly.
+- **Unit (adapter)**: pytest for the thin Python layer (pytket ↔ C++ data mapping).
+- **Integration / differential**: run the unmodified upstream pytest suite against both `pytket_dqc` and the C++-backed package and assert structural equality.
+- **Differential sweeps**: sweep seeds across core and adapter objects to assert bit-for-bit parity and hash-seed invariance.
 
 ### 6.1 The Five Verification Tiers
 | Tier | Description | Command | Scope |

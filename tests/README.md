@@ -27,7 +27,7 @@ They are the interface acceptance gate for the `pytket_dqc_cpp` adapter.
 
 ## Upstream Skips in Vendored Suite
 
-When running `pytest tests -m "not high_compute"`, 7 tests are skipped upstream.
+When running `pytest tests -m "not high_compute"` (which executes 159 tests: 152 passed, 7 skipped), 7 tests are skipped upstream.
 These are identical to the skips present in the upstream `pytket-dqc@1ac175e` repository:
 
 1. `tests/allocator_test.py:152` (`test_refinement_makes_valid`): "Circuit contains CX gates that are not supported."
@@ -37,6 +37,18 @@ These are identical to the skips present in the upstream `pytket-dqc@1ac175e` re
 5. `tests/circuits_test.py:1791` (`test_to_relabeled_registers`): "Tests a function that has been removed"
 6. `tests/network_test.py:122` (`test_nisq_get_placer`): "This test needs to be fixed."
 7. `tests/utils_test.py:56` (`test_CX_circuit`): "Support for CX gates temporarily disabled"
+
+## Deselected High-Compute Tests
+
+When running `pytest tests -m "not high_compute"`, 7 tests marked `@pytest.mark.high_compute` are deselected before execution. These are valid, heavyweight integration tests (10-qubit fixtures, KaHyPar + refiners, and a PyZX `check_equivalence` round-trip) that take substantial execution time (~180s total). Run them with `pytest tests -m high_compute`:
+
+1. `tests/circuits_test.py:1574` (`test_to_pytket_circuit_with_pauli_circ`)
+2. `tests/circuits_test.py:1684` (`test_to_pytket_circuit_pr78_bug`)
+3. `tests/circuits_test.py:2015` (`test_embedding_detached`)
+4. `tests/refiner_test.py:865` (`test_vertex_cover_refiner_pauli_circ`)
+5. `tests/refiner_test.py:922` (`test_vertex_cover_refiner_random_circ`)
+6. `tests/refiner_test.py:1031` (`test_vertex_cover_embedding_boundary_failure`)
+7. `tests/refiner_test.py:1443` (`test_boundary_reallocation_refiner_pauli_circ`)
 
 ## Commands
 
