@@ -6,6 +6,8 @@ Tested with AI-created tests to ensure method outputs are identical across imple
 
 The reference implementation is the upstream Python package `pytket_dqc` (Apache-2.0), installed in the project virtualenv at `.venv/lib/python3.11/site-packages/pytket_dqc/`. The C++ port is verified against it; the original Python code is **never modified**.
 
+For deep-dive architectural design, bridge conversion mechanics, RNG round-tripping, and testing gate designs, see [adapter_details.md](file:///home/ubuntu/pytket-dqc-cpp-packaged/adapter_details.md).
+
 # Design decisions (written by AI agent, based on human+agent planning and iteration)
 
 ## Architecture: hybrid (C++ core + Python pytket API)
@@ -26,7 +28,7 @@ The reference implementation is the upstream Python package `pytket_dqc` (Apache
   - Python `random` module = Mersenne Twister (MT19937) with CPython seeding (`init_by_array` over the little-endian 32-bit words of `|seed|`) and `random()` = `genrand_res53`. Ported as `dqc::PyRandom` (bit-exact).
   - `numpy.random.RandomState` (legacy MT19937) and `scipy.stats.unitary_group` are **not** reproduced in v1 (see deferrals).
 - Rule: move **whole** algorithms to C++; never split one algorithm's RNG consumption across the Python/C++ boundary.
-- `seed=None` is intentionally non-deterministic (no cross-language match is defined; the C++ core initializes from OS entropy `std::random_device` without mutating Python's ambient RNG state). Negative seeds map to their absolute value (CPython semantics).
+- `seed=None` is intentionally non-deterministic (no cross-language match is defined; unseeded `dqc::PyRandom` initializes from OS entropy `std::random_device`). In Python refiner calls, unseeded execution continues whatever ambient stream the caller left, matching upstream behavior. Negative seeds map to their absolute value (CPython semantics).
 
 ## Implemented (C++ core, v1)
 
@@ -212,6 +214,7 @@ partition call (`detail::ScopedStdoutSilencer`).
 - `PacMan.are_hoppable_packets` faithfully reproduces a reference bug: the "reverse the second 1q-op list and retry" fallback is dead code because the guard compares `op.params` (a list) to `0`, which is always `False`.
 - `PyRandom::seed` covers integer seeds `<= 2^64-1`; larger seeds (and arbitrary-int keys) are expressible via `seed_words`.
 - `DetachedGates` in the Python adapter delegates `fixed_vertices` calculation to Python and routes to `BoundaryReallocation`, because the core `detached_gates_refine` entry point segfaults on hyperedges with no gate vertices (such as degenerate hyperedges containing only qubit vertices).
+- `ConstraintException` parity: when hardware communication memory capacity or placement constraints are violated during `Distribution.to_pytket_circuit()`, the pybind11 layer directly translates `dqc::ConstraintException` into `pytket_dqc_cpp.utils.circuit_analysis.ConstraintException`, attaching `.server`, `.v_gate`, and the remediation hint advising `to_pytket_circuit(allow_update=True)`.
 
 ### Hash-seed exactness (PYTHONHASHSEED)
 
