@@ -12,24 +12,23 @@ The reference implementation is the upstream Python package [`pytket_dqc`](https
 ## Prerequisites
 
 - CMake >= 3.20 and a C++20 compiler (GCC >= 12 or Clang >= 16).
-- Python 3.11 with [uv](https://github.com/astral-sh/uv). The project virtual environment at `.venv/` can be synced using `uv sync`.
+- [uv](https://github.com/astral-sh/uv) for Python virtual environment management.
 - Network access on the **first** configure only (CMake fetches Catch2 and pybind11).
-- For the KaHyPar-backed `HypergraphPartitioning` allocator: the KaHyPar source tree (default `/home/ubuntu/kahypar`, override via `-DDQC_KAHYPAR_SOURCE_DIR=/path/to/kahypar`) and Boost (`libboost_program_options`). Note that this differs from upstream `pytket-dqc`: upstream uses the Python `kahypar` package / bindings, whereas here the C++ core compiles and links directly against KaHyPar's C++ source facade (`lib/libkahypar.cc`). If the KaHyPar source directory is not found, CMake disables KaHyPar (`HypergraphPartitioning` allocator and KaHyPar tests are compiled out).
-- **Environment pins (fidelity targets):** pytket 2.16.0, networkx 3.6.1, numpy 2.4.6, scipy 1.17.1, Python 3.11, KaHyPar 1.3.2 (upstream CI pin).
 
 ## Build steps
 
+First, install the Python virtual environment by running `uv sync`.
 
-From the repository root, build the C++ accelerator core and its tests:
+Then, install Boost and KaHyPar, following [these instructions steps 3 & 4](https://github.com/MSRG/dist_qft).
+
+Now, from the repository root, build the C++ accelerator core and its tests:
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DDQC_BUILD_BINDINGS=ON
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DDQC_BUILD_BINDINGS=ON -DDQC_KAHYPAR_SOURCE_DIR=/path/to/kahypar
 cmake --build build -j
 ```
 
-If KaHyPar is installed at a custom location, pass `-DDQC_KAHYPAR_SOURCE_DIR=/path/to/kahypar` to the configure command.
-
-This produces `build/dqc_cpp/_core*.so`, a pybind11 module exposing C++-accelerated Python objects. The KaHyPar INI is copied next to the module, so the `ini_path` default resolves automatically.
+This produces `build/dqc_cpp/_core*.so`, a pybind11 module exposing C++-accelerated Python objects. The KaHyPar INI is already copied next to the module, so the `ini_path` default resolves automatically.
 
 # Test
 
@@ -38,17 +37,16 @@ This produces `build/dqc_cpp/_core*.so`, a pybind11 module exposing C++-accelera
 To run the complete verification suite across all active tiers in a single command, run from the repository root:
 
 ```bash
-./tests/python/run_gates.sh
+./tests/python/run_all_checks.sh
 ```
 
 This gate script automatically:
 
-1. Builds the C++ core with Python bindings enabled (`-DDQC_BUILD_BINDINGS=ON`).
-2. Runs all 89 native C++ Catch2 tests (`ctest --test-dir build --output-on-failure`).
-3. Runs the fast Python test suite via pytest (`152 passed, 7 skipped`).
-4. Runs the core differential equivalence sweep across 4 hash seeds (`check_equivalence.py`).
-5. Runs the adapter differential equivalence sweep across 4 hash seeds (`check_adapter_equivalence.py`, 894 checks/seed, 0 skips).
-
+1. Runs all 89 native C++ Catch2 tests (`ctest --test-dir build --output-on-failure`).
+2. Runs the fast Python test suite via pytest (`152 passed, 7 skipped`).
+3. Runs the core differential equivalence sweep across 4 hash seeds (`check_equivalence.py`).
+4. Runs the adapter differential equivalence sweep across 4 hash seeds (`check_adapter_equivalence.py`, 894 checks/seed, 0 skips).
+5. Runs the QFT benchmark differential test (`check_qft_equivalence.py`), including both the Python and C++ benchmark drivers, the plots, and the field-by-field result comparison.
 ---
 
 ## 1. Run the C++ unit tests

@@ -5,6 +5,7 @@ description = "Re-implementation of Pytket-DQC into C++"
 readme = "README.md"
 requires-python = "==3.11.*"
 dependencies = [
+    "pytest>=9.2.0",
     "pytket-dqc",
 ]
 

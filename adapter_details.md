@@ -212,8 +212,8 @@ To prevent false-positive green runs and silent bypasses:
 2. **Zero Skips Permitted:** Skips are strictly tracked in `SKIPPED[0]`. Any skipped test is treated as a gate failure (`SKIPPED[0] == 0`). Oversubscribed network combinations assert matching capacity exceptions rather than skipping.
 3. **Four-Seed Hash Sweep:** CPython's hash seed affects set iteration order and vertex cover selection. By default, the script executes across `HASH_SEEDS = [0, 1, 42, 12345]`. To isolate a single run, developers must set `DQC_ADAPTER_SINGLE_SEED=1`.
 
-### 6.3 Unified Gate Runner (`run_gates.sh`)
-The executable script `tests/python/run_gates.sh` provides a single command to run Tiers 5, 1, 3, and 4 in sequence under `set -euo pipefail`, unsetting ambient `PYTHONHASHSEED` to safeguard hash-invariance testing.
+### 6.3 Unified Verification Runner (`run_all_checks.sh`)
+The executable script `tests/python/run_all_checks.sh` provides a single command to run Tiers 5, 1, 3, and 4 followed by the QFT benchmark differential test (`check_qft_equivalence.py`) in sequence under `set -euo pipefail`, unsetting ambient `PYTHONHASHSEED` to safeguard hash-invariance testing.
 
 ### 6.4 Upstream Test Skips
 The 7 skipped tests in the fast suite (`tests/README.md`) are identical to upstream's skips:

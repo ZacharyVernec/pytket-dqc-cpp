@@ -52,10 +52,10 @@ When running `pytest tests -m "not high_compute"`, 7 tests marked `@pytest.mark.
 
 ## Commands
 
-Run the full unified verification gate runner:
+Run the full unified verification runner:
 
 ```bash
-./tests/python/run_gates.sh
+./tests/python/run_all_checks.sh
 ```
 
 Or run individual tiers:
