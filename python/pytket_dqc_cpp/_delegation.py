@@ -111,9 +111,9 @@ def reference_module(name: str = "") -> ModuleType:
             raise ImportError(
                 "The reference `pytket_dqc.allocators` requires the Python "
                 "`kahypar` extension, which is not installed. Build KaHyPar "
-                "with -DKAHYPAR_PYTHON_INTERFACE=1 and install its "
-                "`kahypar*.so` into this environment's site-packages "
-                "(see README, 'One-time: KaHyPar')."
+                "with -DKAHYPAR_PYTHON_INTERFACE=1 following the README "
+                "Boost/KaHyPar instructions and put its "
+                "`kahypar*.so` in this environment's site-packages."
             ) from exc
         raise ImportError(
             "This feature is delegated to the reference `pytket_dqc` package, "

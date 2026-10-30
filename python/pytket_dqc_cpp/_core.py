@@ -51,8 +51,8 @@ _REQUIRED_ATTRIBUTE = "HypergraphCircuit"
 
 #: Build command quoted in the error raised when the extension is missing.
 BUILD_COMMAND = (
-    "KAHYPAR_ROOT=/path/to/kahypar "
     "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release "
+    "-DDQC_KAHYPAR_SOURCE_DIR=/path/to/kahypar "
     "-DDQC_BUILD_BINDINGS=ON && cmake --build build -j"
 )
 
@@ -132,7 +132,9 @@ def load_core() -> ModuleType:
             "Build it first with:\n"
             f"    {BUILD_COMMAND}\n"
             "and either install the project (`uv sync` / `pip install .`) or "
-            f"run with `{build_dir()}` present (or on `PYTHONPATH`)."
+            f"run with `{build_dir()}` present (or on `PYTHONPATH`). "
+            "Pass `-DDQC_KAHYPAR_SOURCE_DIR=/path/to/kahypar` to the CMake "
+            "command."
         )
     return module
 
