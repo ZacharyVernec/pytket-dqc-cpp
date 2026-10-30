@@ -7,7 +7,7 @@ We are very confident in the accuracy of this port and plan to use it for our re
 
 The reference implementation is the upstream Python package [`pytket_dqc`](https://github.com/CQCL/pytket-dqc) (Apache-2.0, commit `1ac175e`), installed in the project virtualenv at `.venv/lib/python3.11/site-packages/pytket_dqc/`. The C++ port is verified against it; the original Python code is **never modified**.
 
-# Build
+# Build and install
 
 ## Prerequisites
 
@@ -15,24 +15,65 @@ The reference implementation is the upstream Python package [`pytket_dqc`](https
 - [uv](https://github.com/astral-sh/uv) for Python virtual environment management.
 - Network access on the **first** configure only (CMake fetches Catch2 and pybind11).
 
-## Build steps
+First, install Boost and KaHyPar, following [these instructions steps 3 & 4](https://github.com/MSRG/dist_qft).
 
-First, install the Python virtual environment by running `uv sync`.
+## Build and install the Python package
 
-Then, install Boost and KaHyPar, following [these instructions steps 3 & 4](https://github.com/MSRG/dist_qft).
-
-Now, from the repository root, build the C++ accelerator core and its tests:
+`pyproject.toml` uses `scikit-build-core`, which runs CMake for you.
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DDQC_BUILD_BINDINGS=ON -DDQC_KAHYPAR_SOURCE_DIR=/path/to/kahypar
+export KAHYPAR_ROOT="$HOME/.local/kahypar"   # source tree or install prefix
+uv sync                                       # editable install into .venv
+```
+
+`uv sync` installs the project editably: Python edits take effect immediately;
+after C++ changes, rebuild with `uv sync --reinstall-package pytket-dqc-cpp`.
+
+## Manual development build (C++ tests)
+
+Use this when working on the C++ core or running `ctest`:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+      -DDQC_BUILD_BINDINGS=ON -DDQC_BUILD_TESTS=ON \
+      -DKAHYPAR_ROOT="$KAHYPAR_ROOT"
 cmake --build build -j
 ```
 
-This produces `build/dqc_cpp/_core*.so`, a pybind11 module exposing C++-accelerated Python objects. The KaHyPar INI is already copied next to the module, so the `ini_path` default resolves automatically.
+This produces `build/dqc_cpp/_core*.so`, and the KaHyPar INI is copied next to
+it so the `ini_path` default resolves automatically. The test suite still
+expects this `build/` directory.
+
+To install a manual build without pip, use
+`cmake --install build --prefix <venv>/lib/python3.11/site-packages`.
+
+
+## Using this package from another project
+
+Add a path dependency in `<project-dir>/pyproject.toml`:
+
+```toml
+[project]
+dependencies = ["pytket-dqc-cpp", ...]
+
+[tool.uv.sources]
+pytket-dqc-cpp = { path = "../pytket-dqc-cpp" }
+```
+
+Then:
+
+```bash
+cd /path/to/project-dir
+KAHYPAR_ROOT="$HOME/.local/kahypar" uv sync
+```
 
 # Test
 
 ## Quickstart: Unified Verification Runner
+
+The runner expects the manual development build in `build/` (see
+[Manual development build](#manual-development-build-c-tests)) and the Python
+`kahypar` extension installed in the environment.
 
 To run the complete verification suite across all active tiers in a single command, run from the repository root:
 
@@ -168,7 +209,8 @@ gives you the whole API.
 import pytket_dqc_cpp as pytket_dqc
 from pytket import Circuit
 
-circ = pytket_dqc.DQCPass().apply(Circuit(2).H(0).CU1(0.5, 0, 1))
+circ = Circuit(2).H(0).CU1(0.5, 0, 1)
+pytket_dqc.DQCPass().apply(circ)       # transpiles in place; returns bool
 network = pytket_dqc.NISQNetwork([[0, 1]], {0: [0], 1: [1]})
 distribution = pytket_dqc.allocators.Random().allocate(circ, network)
 
@@ -187,10 +229,12 @@ from pytket_dqc.circuits import HypergraphCircuit   # before
 from pytket_dqc_cpp.circuits import HypergraphCircuit  # after
 ```
 
-Installing/using it means putting `python/` on `sys.path`;
-`pytket_dqc_cpp._core` then locates the compiled extension in
-`build/dqc_cpp/` automatically, or raises an `ImportError` quoting the CMake
-command if it has not been built.
+Install it with `uv sync` (editable) or `uv pip install .`; the compiled
+extension is installed inside the package as `pytket_dqc_cpp/_core*.so`, so
+`import pytket_dqc_cpp` works from any directory. For an uninstalled source
+tree, put `python/` on `sys.path`; `pytket_dqc_cpp._core` then locates the
+extension in `build/dqc_cpp/` (or `DQC_CORE_DIR`), or raises an `ImportError`
+quoting the CMake command if it has not been built.
 
 ## Runtime dependency on the reference package
 
@@ -271,18 +315,33 @@ with what the core computed.
 
 The `HypergraphPartitioning` allocator is backed by KaHyPar (GPL-3.0), called
 through its C facade (`libkahypar.h`). Unlike upstream `pytket-dqc`, which binds
-against Python `kahypar` packages, `pytket_dqc_cpp` links directly against KaHyPar's
-C++ source facade (`lib/libkahypar.cc`). CMake compiles the single-translation-unit
-facade into `dqc_kahypar` (C++17, since KaHyPar uses `requires` as an identifier)
-and links it into the core. It needs:
+against the Python `kahypar` package, `pytket_dqc_cpp` links directly against
+KaHyPar's C++ facade (`lib/libkahypar.cc`) or a prebuilt `libkahypar.so`.
 
-- the KaHyPar source tree (default `/home/ubuntu/kahypar`, override with
-  `-DDQC_KAHYPAR_SOURCE_DIR=...`),
-- Boost headers + `libboost_program_options` (for `parseIniToContext`),
-- the bundled INI config shipped as `python/dqc_cpp/km1_kKaHyPar_sea20.ini` and
-  copied next to the compiled `_core` module. The `ini_path` argument of
-  `_core.hypergraph_partitioning_allocate` defaults to it; pass your own to
-  override.
+The build takes one path input, `KAHYPAR_ROOT` (or the legacy
+`-DDQC_KAHYPAR_SOURCE_DIR`), and auto-detects the layout:
+
+- **SOURCE**: `<root>/lib/libkahypar.cc` exists. CMake compiles the
+  single-translation-unit facade into `dqc_kahypar` (C++17, since KaHyPar uses
+  `requires` as an identifier) and links it into the core. Requires Boost
+  headers and `libboost_program_options`.
+- **INSTALLED**: `<root>/include/libkahypar.h` exists. CMake links the prebuilt
+  `<root>/lib/libkahypar.so`; Boost headers are not needed at build time, but
+  `libboost_program_options.so` is needed at runtime.
+- **PKGCONFIG**: no root given, but `pkg-config` finds `libkahypar`.
+- **OFF**: no KaHyPar. The allocator is unavailable; configure fails unless
+  `-DDQC_REQUIRE_KAHYPAR=OFF` is passed.
+
+The bundled INI config is shipped as
+`python/dqc_cpp/km1_kKaHyPar_sea20.ini`; CMake copies it next to the compiled
+`_core` module, and the install rules place it inside `pytket_dqc_cpp/`. The
+`ini_path` argument of `_core.hypergraph_partitioning_allocate` defaults to it;
+pass your own to override.
+
+The **Python** `kahypar` extension is a separate artifact. It is required by the
+reference `pytket_dqc` (which imports it from `pytket_dqc.allocators`) and must
+be installed in every venv that runs the reference, the differential tests, or
+`dist_qft`. `pytket_dqc_cpp` itself does not import it.
 
 The reference Python `kahypar` module and the C facade issue the same
 `PartitionerFacade().partition` call with the same `Context`, so placements are

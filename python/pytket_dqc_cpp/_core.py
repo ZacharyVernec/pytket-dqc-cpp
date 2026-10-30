@@ -51,14 +51,15 @@ _REQUIRED_ATTRIBUTE = "HypergraphCircuit"
 
 #: Build command quoted in the error raised when the extension is missing.
 BUILD_COMMAND = (
-    "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DDQC_BUILD_BINDINGS=ON "
-    "&& cmake --build build -j"
+    "KAHYPAR_ROOT=/path/to/kahypar "
+    "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release "
+    "-DDQC_BUILD_BINDINGS=ON && cmake --build build -j"
 )
 
 
 def _package_dir() -> str:
     """Directory containing this file (``python/pytket_dqc_cpp``)."""
-    return os.path.dirname(os.path.abspath(__file__))
+    return os.path.dirname(os.path.realpath(__file__))
 
 
 def _repo_root() -> str:
@@ -67,7 +68,15 @@ def _repo_root() -> str:
 
 
 def build_dir() -> str:
-    """Absolute path of the CMake build directory holding ``_core``."""
+    """Absolute path of the CMake build directory holding ``_core``.
+
+    ``DQC_CORE_DIR`` overrides the default ``<repo>/build/dqc_cpp`` so that
+    alternate CMake build directories (or a staged install) can be used
+    without editing the package.
+    """
+    override = os.environ.get("DQC_CORE_DIR")
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
     return os.path.join(_repo_root(), *_BUILD_SUBDIR)
 
 
@@ -122,8 +131,8 @@ def load_core() -> ModuleType:
             "Could not import the compiled `_core` extension module.\n"
             "Build it first with:\n"
             f"    {BUILD_COMMAND}\n"
-            "and either install the project (`pip install .`) or run with "
-            f"`{build_dir()}` present (or on `PYTHONPATH`)."
+            "and either install the project (`uv sync` / `pip install .`) or "
+            f"run with `{build_dir()}` present (or on `PYTHONPATH`)."
         )
     return module
 

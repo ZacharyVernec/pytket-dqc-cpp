@@ -748,7 +748,7 @@ wheels = [
 [[package]]
 name = "pytket-dqc"
 version = "0.0.1"
-source = { git = "https://github.com/CQCL/pytket-dqc.git#1ac175ed820ac02366b2ed71b653d5b96fc72ff7" }
+source = { git = "https://github.com/CQCL/pytket-dqc.git?rev=1ac175ed820ac02366b2ed71b653d5b96fc72ff7#1ac175ed820ac02366b2ed71b653d5b96fc72ff7" }
 dependencies = [
     { name = "celluloid" },
     { name = "decorator" },
@@ -765,17 +765,21 @@ dependencies = [
 [[package]]
 name = "pytket-dqc-cpp"
 version = "0.0.2"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
-    { name = "pytest" },
     { name = "pytket-dqc" },
 ]
 
-[package.metadata]
-requires-dist = [
-    { name = "pytest", specifier = ">=9.2.0" },
-    { name = "pytket-dqc", git = "https://github.com/CQCL/pytket-dqc.git" },
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
 ]
+
+[package.metadata]
+requires-dist = [{ name = "pytket-dqc", git = "https://github.com/CQCL/pytket-dqc.git?rev=1ac175ed820ac02366b2ed71b653d5b96fc72ff7" }]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=9.2.0" }]
 
 [[package]]
 name = "pytket-pyzx"

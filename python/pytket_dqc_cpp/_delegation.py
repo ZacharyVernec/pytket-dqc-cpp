@@ -107,6 +107,14 @@ def reference_module(name: str = "") -> ModuleType:
     try:
         return importlib.import_module(module_name)
     except ImportError as exc:  # pragma: no cover - depends on the environment
+        if getattr(exc, "name", None) == "kahypar":
+            raise ImportError(
+                "The reference `pytket_dqc.allocators` requires the Python "
+                "`kahypar` extension, which is not installed. Build KaHyPar "
+                "with -DKAHYPAR_PYTHON_INTERFACE=1 and install its "
+                "`kahypar*.so` into this environment's site-packages "
+                "(see README, 'One-time: KaHyPar')."
+            ) from exc
         raise ImportError(
             "This feature is delegated to the reference `pytket_dqc` package, "
             "which could not be imported. Install it with "

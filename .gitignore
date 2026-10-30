@@ -1,5 +1,7 @@
 build/
+dist/
 __pycache__/
 *.pyc
 python/dqc_cpp/_core*.so
+python/pytket_dqc_cpp/_core*.so
 tests/python/qft/results_*/
