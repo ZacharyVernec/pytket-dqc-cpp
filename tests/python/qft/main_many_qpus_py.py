@@ -187,7 +187,7 @@ def main():
 
         output_string = ""
 
-        for num_partitions in range(3, 4+1):
+        for num_partitions in range(3, 6+1):
             num_qubits = num_partitions * qpu_size
 
             print(f"Testing {num_partitions=}")

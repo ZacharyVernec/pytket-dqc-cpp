@@ -93,6 +93,19 @@ struct BuiltVertex {
   std::vector<int> out_wires;  // port order
 };
 
+// Compact, derived-state-free copy of a `BuiltCircuit` (qubits in first-seen
+// order plus the add-order command list). The DAG (vertices/wires/frontiers)
+// is recomputed by `BuiltCircuit::restore`, so nothing derived is stored.
+struct BuiltCircuitSnapshot {
+  std::vector<std::string> qubits;
+  std::vector<BuiltCommand> commands;
+};
+
+// Resume checkpoint interval for the `allow_update` path: the builder state is
+// snapshotted every this-many hyperedges so that a hyperedge split can resume
+// from the closest checkpoint instead of restarting the whole pass.
+inline constexpr std::size_t kResumeStride = 8;
+
 // Circuit builder used by `to_pytket_circuit`. `commands` records the add
 // order (mirroring the sequence of pytket `add_gate`/`add_barrier` calls in
 // the reference); `rebuild_dag()` materialises the DAG that lets
@@ -170,6 +183,18 @@ struct BuiltCircuit {
       }
       vertices[vidx].out_wires = out;
     }
+  }
+  // State snapshot used by the `allow_update` resume path (see
+  // `to_pytket_circuit`). Only the source data is stored: restoring rebuilds
+  // the DAG, which is a pure function of `qubits` + `commands`.
+  BuiltCircuitSnapshot snapshot() const { return {qubits, commands}; }
+  void restore(const BuiltCircuitSnapshot& s) {
+    qubits = s.qubits;
+    qubit_ids.clear();
+    qubit_ids.reserve(qubits.size());
+    for (const std::string& q : qubits) qubit_ids.push_back(parse_unit_id(q));
+    commands = s.commands;
+    rebuild_dag();
   }
   // Reproduce pytket's `Circuit.get_commands()` order: iterate slices
   // (frontier cuts) and, within each slice, order vertices by the first
@@ -320,6 +345,10 @@ struct LinkManager {
   std::map<int, std::vector<std::string>> available;
   std::map<int, std::vector<std::string>> occupied;
   std::map<std::string, std::string> link_qubit_id_update;
+  // `steiner_tree(server_graph, servers_of(hyperedge))` is the same for every
+  // CU1 gate of this hyperedge, so compute it lazily once instead of once per
+  // `start_link` call. Pure caching: the value is identical.
+  std::optional<Graph> hyperedge_tree_cache;
 
   LinkManager(const TPCContext& ctx, const Hyperedge& h,
               const std::vector<int>& servers)
@@ -328,6 +357,18 @@ struct LinkManager {
       available[s] = {};
       occupied[s] = {};
     }
+  }
+
+  const Graph& hyperedge_tree() {
+    if (!hyperedge_tree_cache.has_value()) {
+      std::vector<int> hyp_servers;
+      hyp_servers.reserve(hyperedge.vertices.size());
+      for (const Vertex v : hyperedge.vertices) {
+        hyp_servers.push_back(ctx.placement.at(v));
+      }
+      hyperedge_tree_cache = steiner_tree(ctx.server_graph, hyp_servers);
+    }
+    return *hyperedge_tree_cache;
   }
 
   Vertex qubit_vertex() const {
@@ -419,11 +460,8 @@ struct LinkManager {
   std::vector<std::pair<std::string, std::string>> start_link(int target) {
     const int q_vertex = qubit_vertex();
     const int home = ctx.placement.at(q_vertex);
-    std::vector<int> hyp_servers;
-    for (const Vertex v : hyperedge.vertices) {
-      hyp_servers.push_back(ctx.placement.at(v));
-    }
-    const Graph tree = steiner_tree(ctx.server_graph, hyp_servers);
+    // Only depends on the hyperedge, so it is cached across `start_link` calls.
+    const Graph& tree = hyperedge_tree();
     // assert target in hyp_servers (guaranteed by construction)
 
     std::vector<int> connected = connected_servers();
@@ -823,9 +861,14 @@ inline BuiltCircuit one_hyperedge(const Hyperedge& hyperedge,
 
 // Mirrors the `allow_update` fallback: choose a hyperedge to split and mutate
 // `dist.circuit` in place. Returns the chosen hyperedge (informational; the
-// production caller in `to_pytket_circuit` ignores it).
+// production caller in `to_pytket_circuit` ignores it). When `out_index` is
+// given it receives the chosen hyperedge's index in `hyperedge_list()` *before*
+// the split, which is exactly the position where the two halves are inserted,
+// i.e. the earliest index whose build result can change.
 inline std::optional<Hyperedge> split_for_bound(Distribution& dist,
-                                                const ConstraintException& e) {
+                                                const ConstraintException& e,
+                                                std::size_t* out_index =
+                                                    nullptr) {
   const HypergraphCircuit& hyp_circ = dist.circuit;
   const Placement& placement = dist.placement;
   const Graph& server_graph = dist.server_graph;
@@ -912,6 +955,11 @@ inline std::optional<Hyperedge> split_for_bound(Distribution& dist,
   }
 
   const Hyperedge& chosen_hedge = *chosen;
+  if (out_index != nullptr) {
+    // Same index `split_hyperedge` will use (first match in the list), so the
+    // hyperedges before it are provably untouched by the split.
+    *out_index = hyp_circ.index_in_list(chosen_hedge);
+  }
   const Vertex v_q = hyp_circ.get_qubit_vertex(chosen_hedge);
   std::vector<Vertex> gates = hyp_circ.get_gate_vertices(chosen_hedge);
 
@@ -985,14 +1033,59 @@ inline ToPytketCircuitResult to_pytket_circuit(Distribution& dist,
     }
     new_circ.rebuild_dag();
 
-    try {
-      for (const Hyperedge& hedge : dist.circuit.hyperedge_list()) {
-        new_circ = tpc_internal::one_hyperedge(hedge, new_circ, ctx);
+    // Walk the hyperedges one at a time. The reference splits *one* hyperedge
+    // and then restarts the whole build from the initial circuit. That restart
+    // is unobservable, though: splitting a hyperedge only rewrites positions
+    // >= its own index in `hyperedge_list()`, the builder is deterministic, and
+    // every hyperedge's work depends only on the circuit built so far. So on a
+    // constraint violation we resume from the earliest index whose result can
+    // have changed (replaying from the closest checkpoint) instead of redoing
+    // the entire pass. The sequence of splits — and therefore the final
+    // hypergraph and circuit — is exactly the reference's.
+    std::vector<tpc_internal::BuiltCircuitSnapshot> checkpoints;
+    std::size_t start = 0;
+    for (;;) {
+      const std::vector<Hyperedge>& hedges = dist.circuit.hyperedge_list();
+      bool split_happened = false;
+      for (std::size_t j = start; j < hedges.size(); ++j) {
+        if (j % tpc_internal::kResumeStride == 0 &&
+            j / tpc_internal::kResumeStride == checkpoints.size()) {
+          checkpoints.push_back(new_circ.snapshot());
+        }
+        // A hyperedge holding only its qubit vertex is a no-op: the reference
+        // returns the circuit unchanged. Skip the call rather than copying the
+        // whole circuit out and back in.
+        if (hedges[j].vertices.size() == 1) continue;
+        try {
+          new_circ = tpc_internal::one_hyperedge(hedges[j], new_circ, ctx);
+        } catch (ConstraintException& e) {
+          if (!allow_update) throw;
+          std::size_t split_index = j;
+          tpc_internal::split_for_bound(dist, e, &split_index);
+          // Everything before the split (and before the failing hyperedge,
+          // whose partial work was discarded) is still valid.
+          const std::size_t resume = std::min(j, split_index);
+          if (resume < j) {
+            // Roll back to the nearest checkpoint and replay up to `resume`.
+            // The replayed hyperedges are the same ones that just succeeded
+            // with the same prefix, so this cannot fail.
+            const std::size_t cp = resume / tpc_internal::kResumeStride;
+            checkpoints.resize(cp + 1);
+            new_circ.restore(checkpoints[cp]);
+            const std::vector<Hyperedge>& after =
+                dist.circuit.hyperedge_list();
+            for (std::size_t r = cp * tpc_internal::kResumeStride; r < resume;
+                 ++r) {
+              if (after[r].vertices.size() == 1) continue;
+              new_circ = tpc_internal::one_hyperedge(after[r], new_circ, ctx);
+            }
+          }
+          start = resume;
+          split_happened = true;
+          break;
+        }
       }
-    } catch (ConstraintException& e) {
-      if (!allow_update) throw;
-      tpc_internal::split_for_bound(dist, e);
-      continue;  // retry the whole body with the updated hypergraph
+      if (!split_happened) break;  // pass completed
     }
 
     SerializedCircuit out;

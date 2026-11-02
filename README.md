@@ -197,6 +197,21 @@ For deep-dive architectural design, bridge conversion mechanics, RNG round-tripp
 - **Set iteration order**: CPython's deterministic `set`/`dict` iteration order for `int`/`tuple`/`frozenset` and string keys is replicated in C++ (`PySet`, SipHash) wherever it affects combinatorial results (Steiner-tree terminal order, bipartition assignment, boundary detection, and packet ordering). Thus, when `PYTHONHASHSEED` is set, results match upstream bit-for-bit.
 - **Randomness**: The RNG is **bit-exact**: Python's Mersenne Twister (MT19937 with CPython array seeding and `genrand_res53`) is ported as `dqc::PyRandom`. Algorithms are moved to C++ in their entirety to prevent splitting RNG consumption across the language boundary. Ambient RNG state is forwarded and restored around core operations (see `RNG semantics` below and [`adapter_details.md`](adapter_details.md)).
 
+## Performance: `Distribution.to_pytket_circuit`
+
+`to_pytket_circuit` is the hottest step of the distribution pipeline. With
+`allow_update=True` the reference splits one hyperedge on every communication-memory
+violation and then rebuilds the whole circuit from scratch, which makes the cost
+grow as (#restarts × circuit length) — 138 rebuilds and ~11 000 hyperedge passes
+on a 16-qubit QFT distribution. The C++ port keeps the reference's exact split
+sequence but resumes from the split point instead of restarting, caches the
+Steiner tree per hyperedge, and skips no-op (qubit-only) hyperedges. Measured on
+the QFT benchmark (4 QPUs, memory bound 2, core only): 10.0 s → 2.3 s (QFT 16),
+79.2 s → 17.0 s (QFT 20), 304.4 s → 41.4 s (QFT 24), with byte-identical output.
+See [`to_pytket_circuit_performance.md`](to_pytket_circuit_performance.md) for the
+algorithmic details, the measurement method, the equivalence evidence and the
+remaining hot spots.
+
 ## Out of scope
 
 - Drawing / visualisation (`draw()`, `draw_nisq_network`, `draw_server_network`; hypernetx, matplotlib, graphviz). Cosmetic only.
