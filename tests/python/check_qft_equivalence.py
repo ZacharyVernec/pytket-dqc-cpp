@@ -22,8 +22,12 @@ Run with the project venv (from anywhere):
     .venv/bin/python3 tests/python/check_qft_equivalence.py
 
 Options:
-    --skip-computation   do not re-run the benchmark drivers; still regenerate
+    --skip-computation   do not re-run any benchmark driver; still regenerate
                          the plots and compare the existing result files
+    --skip-python-computation
+                         do not re-run the Python reference drivers; the C++
+                         drivers still run and the existing Python result
+                         files are used for the comparison
     --skip-plots         do not regenerate the plots
 
 Exits non-zero on a failing benchmark script or on any mismatch.
@@ -148,8 +152,12 @@ def main(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "--skip-computation", action="store_true",
-        help="skip the benchmark drivers; still regenerate the plots and "
+        help="skip all benchmark drivers; still regenerate the plots and "
              "compare the existing result files")
+    parser.add_argument(
+        "--skip-python-computation", action="store_true",
+        help="skip the Python reference drivers; the C++ drivers still run "
+             "and the existing Python result files are compared")
     parser.add_argument(
         "--skip-plots", action="store_true",
         help="do not regenerate the plots")
@@ -164,8 +172,13 @@ def main(argv=None):
     if args.skip_computation:
         print("--skip-computation: reusing the existing result files\n")
     else:
+        if args.skip_python_computation:
+            print("--skip-python-computation: reusing the existing python "
+                  "result files\n")
         for benchmark in BENCHMARKS:
             for variant in VARIANTS:
+                if variant == "py" and args.skip_python_computation:
+                    continue
                 run_script(QFT_DIR / f"main_{benchmark}_qpus_{variant}.py")
 
     if not args.skip_plots:
