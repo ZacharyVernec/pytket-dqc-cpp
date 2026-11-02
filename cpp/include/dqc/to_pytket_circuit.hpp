@@ -1,11 +1,13 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdint>
 #include <map>
 #include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -37,16 +39,37 @@ struct ToPytketCircuitResult {
 
 namespace tpc_internal {
 
-// A command in the circuit being incrementally built. Standard gates carry
-// their pytket op name; custom gates carry "starting_process"/"ending_process".
-// A starting process records its origin qubit (the compute qubit it copies)
-// explicitly, mirroring `start_proc(origin=...)` + `origin_of_start_proc`.
+// Structural tags carried by `BuiltCommand`. The op *name* is only needed when
+// a command is emitted or copied verbatim, so these cases are tagged once
+// instead of being re-detected with string prefixes on every scan.
+enum : std::uint8_t {
+  kCmdStartProc = 1,
+  kCmdEndProc = 2,
+  kCmdBarrier = 4,
+};
+
+// A command in the circuit being incrementally built, in *interned* form.
+// Qubit ids index the shared `TPCTables::qubits` table and `op` indexes
+// `TPCTables::ops`, so the struct is trivially copyable: copying the command
+// list per hyperedge no longer allocates or deep-copies strings.
+// Commands of arity > 2 are stored either as a prefix of the circuit's qubit
+// order (`kCmdBarrier` + `barrier_n`) or in `TPCTables::wide_qubits`
+// (`wide`); parameter lists longer than two values live in
+// `TPCTables::param_lists` (`params_idx`).
 struct BuiltCommand {
-  std::string op_name;
+  int op = -1;            // interned op name (only read when emitting)
   int op_type = -1;
-  std::vector<double> params;
-  std::vector<std::string> qubits;
-  std::string start_origin;  // only meaningful for starting_process
+  int q0 = -1;            // qubit id
+  int q1 = -1;            // qubit id
+  int start_origin = -1;  // qubit id; only meaningful for starting_process
+  int wide = -1;          // TPCTables::wide_qubits entry when arity > 2
+  int params_idx = -1;    // TPCTables::param_lists entry when n_params > 2
+  int barrier_n = 0;      // kCmdBarrier: number of leading circuit qubits
+  double p0 = 0.0;
+  double p1 = 0.0;
+  int n_params = 0;
+  std::uint8_t arity = 0;
+  std::uint8_t flags = 0;
 };
 
 // A tket `UnitID`: register name + index vector, compared by (name, index).
@@ -78,6 +101,83 @@ inline UnitID parse_unit_id(const std::string& q) {
   return id;
 }
 
+// Shared, append-only interning tables for one `to_pytket_circuit` attempt.
+// Interning qubit names means ids stay valid across every `BuiltCircuit`
+// built during the attempt (so commands can be moved between circuits without
+// touching strings), and per-qubit metadata is parsed once at intern time
+// instead of on every use.
+struct QubitTable {
+  std::vector<std::string> names;
+  std::vector<UnitID> unit_ids;
+  std::vector<int> server_ids;
+  std::vector<unsigned char> is_link;
+  std::unordered_map<std::string, int> index;
+
+  int intern(const std::string& q) {
+    const auto it = index.find(q);
+    if (it != index.end()) return it->second;
+    const int id = static_cast<int>(names.size());
+    index.emplace(q, id);
+    names.push_back(q);
+    unit_ids.push_back(parse_unit_id(q));
+    server_ids.push_back(get_server_id(q));
+    is_link.push_back(is_link_qubit(q) ? 1 : 0);
+    return id;
+  }
+  int find(const std::string& q) const {
+    const auto it = index.find(q);
+    return it == index.end() ? -1 : it->second;
+  }
+};
+
+struct OpTable {
+  std::vector<std::string> names;
+  std::unordered_map<std::string, int> index;
+
+  int intern(const std::string& s) {
+    const auto it = index.find(s);
+    if (it != index.end()) return it->second;
+    const int id = static_cast<int>(names.size());
+    index.emplace(s, id);
+    names.push_back(s);
+    return id;
+  }
+};
+
+struct TPCTables {
+  QubitTable qubits;
+  OpTable ops;
+  // Rare escape hatches: commands with more than two qubits (other than
+  // barriers) or more than two parameters.
+  std::vector<std::vector<int>> wide_qubits;
+  std::vector<std::vector<double>> param_lists;
+  // Cached ids of the op names the builder emits itself.
+  int op_h = -1;
+  int op_rz = -1;
+  int op_cu1 = -1;
+  int op_cz = -1;
+  int op_start = -1;
+  int op_end = -1;
+
+  void init_std() {
+    if (op_h >= 0) return;
+    op_h = ops.intern("H");
+    op_rz = ops.intern("Rz");
+    op_cu1 = ops.intern("CU1");
+    op_cz = ops.intern("CZ");
+    op_start = ops.intern("starting_process");
+    op_end = ops.intern("ending_process");
+  }
+  int intern_wide(std::vector<int> v) {
+    wide_qubits.push_back(std::move(v));
+    return static_cast<int>(wide_qubits.size()) - 1;
+  }
+  int intern_params(std::vector<double> v) {
+    param_lists.push_back(std::move(v));
+    return static_cast<int>(param_lists.size()) - 1;
+  }
+};
+
 // A wire on a qubit's path: source/target vertex index, or -1 for the
 // input/output boundary.
 struct Wire {
@@ -93,11 +193,13 @@ struct BuiltVertex {
   std::vector<int> out_wires;  // port order
 };
 
-// Compact, derived-state-free copy of a `BuiltCircuit` (qubits in first-seen
+// Compact, derived-state-free copy of a `BuiltCircuit` (qubit ids in first-seen
 // order plus the add-order command list). The DAG (vertices/wires/frontiers)
-// is recomputed by `BuiltCircuit::restore`, so nothing derived is stored.
+// is recomputed by `BuiltCircuit::restore`, so nothing derived is stored. The
+// interning tables are append-only for the whole attempt, so the ids stay
+// valid after a rollback.
 struct BuiltCircuitSnapshot {
-  std::vector<std::string> qubits;
+  std::vector<int> qubit_order;
   std::vector<BuiltCommand> commands;
 };
 
@@ -112,87 +214,124 @@ inline constexpr std::size_t kResumeStride = 8;
 // `get_commands_order()` reproduce pytket's `Circuit.get_commands()` order
 // (slices in temporal order, within a slice by UnitID).
 struct BuiltCircuit {
-  std::vector<std::string> qubits;  // first-seen order
-  std::vector<UnitID> qubit_ids;
-  std::vector<int> qubit_first_wire;  // wire id of the input wire per qubit
-  std::vector<BuiltCommand> commands; // add order (barriers included)
+  TPCTables* tables = nullptr;         // shared, append-only for the attempt
+  std::vector<int> qubit_order;        // qubit ids, first-seen order
+  std::vector<unsigned char> present;  // id -> present in this circuit
+  std::vector<int> qubit_first_wire;   // id -> input wire
+  std::vector<int> frontier_wire;      // id -> current tip wire
+  std::vector<BuiltCommand> commands;  // add order (barriers included)
   std::vector<BuiltVertex> vertices;
   std::vector<Wire> wires;
-  std::vector<int> frontier_wire;     // current tip wire per qubit
   int wire_seq = 0;
+  // Scratch stamps for `get_commands_order` (see there). Reused across calls
+  // instead of being reallocated/cleared once per slice.
+  mutable std::vector<int> in_edge_stamp_;
+  mutable std::vector<int> in_slice_stamp_;
+  mutable std::vector<int> bad_stamp_;
+  mutable int epoch_ = 0;
 
-  int qubit_index(const std::string& q) const {
-    for (int i = 0; i < static_cast<int>(qubits.size()); ++i) {
-      if (qubits[i] == q) return i;
+  explicit BuiltCircuit(TPCTables* t = nullptr) : tables(t) {}
+
+  const std::string& qubit_name(int id) const {
+    return tables->qubits.names[id];
+  }
+  int qubit_server(int id) const { return tables->qubits.server_ids[id]; }
+  bool qubit_is_link(int id) const { return tables->qubits.is_link[id] != 0; }
+  const std::string& op_name(int id) const { return tables->ops.names[id]; }
+  std::vector<double> params_of(const BuiltCommand& c) const {
+    if (c.params_idx >= 0) return tables->param_lists[c.params_idx];
+    std::vector<double> out;
+    if (c.n_params > 0) out.push_back(c.p0);
+    if (c.n_params > 1) out.push_back(c.p1);
+    return out;
+  }
+  void add_qubit_id(int id) {
+    if (static_cast<int>(present.size()) <= id) present.resize(id + 1, 0);
+    if (present[id] == 0) {
+      present[id] = 1;
+      qubit_order.push_back(id);
     }
-    return -1;
   }
-  bool has_qubit(const std::string& q) const { return qubit_index(q) >= 0; }
-  void add_qubit(const std::string& q) {
-    if (has_qubit(q)) return;
-    qubits.push_back(q);
-    qubit_ids.push_back(parse_unit_id(q));
+  int add_qubit(const std::string& name) {
+    const int id = tables->qubits.intern(name);
+    add_qubit_id(id);
+    return id;
   }
-  // Append a command to the add-order list (the DAG is materialised later by
-  // `rebuild_dag`). Returns its index.
-  int push_command(const BuiltCommand& cmd) {
-    commands.push_back(cmd);
-    return static_cast<int>(commands.size()) - 1;
+  // Number of qubits a command acts on.
+  int cmd_arity(const BuiltCommand& c) const {
+    if ((c.flags & kCmdBarrier) != 0) return c.barrier_n;
+    if (c.wide >= 0) {
+      return static_cast<int>(tables->wide_qubits[c.wide].size());
+    }
+    return c.arity;
   }
-  // Mirror `new_circ.add_barrier(new_circ.qubits)`: a barrier over every
-  // qubit currently in the circuit.
+  // Qubit id of port `p` of a command, in port order.
+  int cmd_qubit(const BuiltCommand& c, int p) const {
+    if ((c.flags & kCmdBarrier) != 0) return qubit_order[p];
+    if (c.wide >= 0) return tables->wide_qubits[c.wide][p];
+    return p == 0 ? c.q0 : c.q1;
+  }
+  // Mirror `new_circ.add_barrier(new_circ.qubits)`: a barrier over every qubit
+  // currently in the circuit. `qubit_order` is append-only, so it is enough to
+  // record the current length instead of copying every qubit.
   void push_barrier_over_all() {
     BuiltCommand b;
-    b.op_name = "Barrier";
     b.op_type = kOpBarrier;
-    for (const std::string& q : qubits) b.qubits.push_back(q);
-    commands.push_back(std::move(b));
+    b.flags = kCmdBarrier;
+    b.barrier_n = static_cast<int>(qubit_order.size());
+    commands.push_back(b);
   }
-  // Rebuild the DAG (vertices/wires/frontiers) from `qubits` + `commands` in
-  // add order, exactly as pytket's `add_gate`/`add_barrier` wire up the DAG.
+  // Rebuild the DAG (vertices/wires/frontiers) from `qubit_order` + `commands`
+  // in add order, exactly as pytket's `add_gate`/`add_barrier` wire up the DAG.
   void rebuild_dag() {
     vertices.clear();
     wires.clear();
-    frontier_wire.clear();
     wire_seq = 0;
-    qubit_first_wire.assign(qubits.size(), -1);
-    for (int qi = 0; qi < static_cast<int>(qubits.size()); ++qi) {
+    const std::size_t n_qubits = tables->qubits.names.size();
+    qubit_first_wire.assign(n_qubits, -1);
+    frontier_wire.assign(n_qubits, -1);
+    for (const int qi : qubit_order) {
       const int w = wire_seq++;
       wires.push_back({w, qi, -1, -1});
       qubit_first_wire[qi] = w;
-      frontier_wire.push_back(w);
+      frontier_wire[qi] = w;
     }
     for (const BuiltCommand& cmd : commands) {
       const int vidx = static_cast<int>(vertices.size());
+      const int arity = cmd_arity(cmd);
       std::vector<int> in;
       std::vector<int> out;
-      for (const std::string& q : cmd.qubits) {
-        const int qi = qubit_index(q);
-        if (qi < 0) throw std::runtime_error("rebuild_dag: unknown qubit " + q);
+      in.reserve(arity);
+      out.reserve(arity);
+      for (int p = 0; p < arity; ++p) {
+        const int qi = cmd_qubit(cmd, p);
         const int w = frontier_wire[qi];
+        if (w < 0) {
+          throw std::runtime_error("rebuild_dag: unknown qubit " +
+                                   qubit_name(qi));
+        }
         in.push_back(w);
         wires[w].target = vidx;
       }
       vertices.push_back({cmd, in, {}});
-      for (const std::string& q : cmd.qubits) {
-        const int qi = qubit_index(q);
+      for (int p = 0; p < arity; ++p) {
+        const int qi = cmd_qubit(cmd, p);
         const int w = wire_seq++;
         wires.push_back({w, qi, vidx, -1});
         out.push_back(w);
         frontier_wire[qi] = w;
       }
-      vertices[vidx].out_wires = out;
+      vertices[vidx].out_wires = std::move(out);
     }
   }
   // State snapshot used by the `allow_update` resume path (see
   // `to_pytket_circuit`). Only the source data is stored: restoring rebuilds
-  // the DAG, which is a pure function of `qubits` + `commands`.
-  BuiltCircuitSnapshot snapshot() const { return {qubits, commands}; }
+  // the DAG, which is a pure function of `qubit_order` + `commands`.
+  BuiltCircuitSnapshot snapshot() const { return {qubit_order, commands}; }
   void restore(const BuiltCircuitSnapshot& s) {
-    qubits = s.qubits;
-    qubit_ids.clear();
-    qubit_ids.reserve(qubits.size());
-    for (const std::string& q : qubits) qubit_ids.push_back(parse_unit_id(q));
+    qubit_order = s.qubit_order;
+    present.assign(tables->qubits.names.size(), 0);
+    for (const int id : qubit_order) present[id] = 1;
     commands = s.commands;
     rebuild_dag();
   }
@@ -200,50 +339,58 @@ struct BuiltCircuit {
   // (frontier cuts) and, within each slice, order vertices by the first
   // reaching frontier edge, which is in UnitID order. Returns vertex indices.
   std::vector<int> get_commands_order() const {
-    std::vector<int> qorder(qubits.size());
-    for (int i = 0; i < static_cast<int>(qubits.size()); ++i) qorder[i] = i;
-    std::sort(qorder.begin(), qorder.end(),
-              [&](int a, int b) { return qubit_ids[a] < qubit_ids[b]; });
+    std::vector<int> qorder = qubit_order;
+    std::sort(qorder.begin(), qorder.end(), [&](int a, int b) {
+      return tables->qubits.unit_ids[a] < tables->qubits.unit_ids[b];
+    });
     std::vector<int> frontier = qubit_first_wire;
     std::vector<int> order;
-    std::vector<char> in_slice(vertices.size(), 0);
-    std::vector<char> bad(vertices.size(), 0);
-    std::vector<char> in_edge;
+    // Per-slice bookkeeping is done with monotonic epoch stamps against these
+    // persistent buffers instead of clearing whole O(wires)/O(vertices) arrays
+    // once per slice: the slice loop runs once per barrier (~#CU1) and each
+    // clear was O(circuit size), which dominated the whole build.
+    if (in_edge_stamp_.size() < wires.size()) {
+      in_edge_stamp_.resize(wires.size(), 0);
+    }
+    if (in_slice_stamp_.size() < vertices.size()) {
+      in_slice_stamp_.resize(vertices.size(), 0);
+    }
+    if (bad_stamp_.size() < vertices.size()) {
+      bad_stamp_.resize(vertices.size(), 0);
+    }
+    int& epoch = epoch_;
     for (;;) {
-      std::vector<int> all_edges;
-      all_edges.reserve(qubits.size());
-      for (const int qi : qorder) all_edges.push_back(frontier[qi]);
-      in_edge.assign(wires.size(), 0);
-      for (const int w : all_edges) in_edge[w] = 1;
-      std::fill(in_slice.begin(), in_slice.end(), 0);
-      std::fill(bad.begin(), bad.end(), 0);
+      ++epoch;
+      for (const int qi : qorder) in_edge_stamp_[frontier[qi]] = epoch;
       std::vector<int> slice;
-      for (const int w : all_edges) {
-        const int v = wires[w].target;
-        if (v < 0 || in_slice[v] || bad[v]) continue;
+      for (const int qi : qorder) {
+        const int v = wires[frontier[qi]].target;
+        if (v < 0 || in_slice_stamp_[v] == epoch || bad_stamp_[v] == epoch) {
+          continue;
+        }
         bool good = true;
         for (const int iw : vertices[v].in_wires) {
-          if (!in_edge[iw]) {
+          if (in_edge_stamp_[iw] != epoch) {
             good = false;
             break;
           }
         }
         if (!good) {
-          bad[v] = 1;
+          bad_stamp_[v] = epoch;
           continue;
         }
-        in_slice[v] = 1;
+        in_slice_stamp_[v] = epoch;
         slice.push_back(v);
       }
       if (slice.empty()) break;
       for (const int v : slice) order.push_back(v);
       for (const int qi : qorder) {
-        const int w = frontier[qi];
-        const int v = wires[w].target;
-        if (v >= 0 && in_slice[v]) {
+        const int v = wires[frontier[qi]].target;
+        if (v >= 0 && in_slice_stamp_[v] == epoch) {
           const BuiltCommand& c = vertices[v].cmd;
-          for (int p = 0; p < static_cast<int>(c.qubits.size()); ++p) {
-            if (qubit_index(c.qubits[p]) == qi) {
+          const int arity = cmd_arity(c);
+          for (int p = 0; p < arity; ++p) {
+            if (cmd_qubit(c, p) == qi) {
               frontier[qi] = vertices[v].out_wires[p];
               break;
             }
@@ -256,33 +403,37 @@ struct BuiltCircuit {
 };
 
 inline bool is_start_proc_cmd(const BuiltCommand& c) {
-  return c.op_type == kOpCustomGate &&
-         c.op_name.rfind("starting_process", 0) == 0;
+  return (c.flags & kCmdStartProc) != 0;
 }
 
 inline bool is_end_proc_cmd(const BuiltCommand& c) {
-  return c.op_type == kOpCustomGate &&
-         c.op_name.rfind("ending_process", 0) == 0;
+  return (c.flags & kCmdEndProc) != 0;
 }
 
-inline bool qubit_in(const BuiltCommand& c, const std::string& q) {
-  return std::find(c.qubits.begin(), c.qubits.end(), q) != c.qubits.end();
+inline bool cmd_has_qubit(const BuiltCircuit& circ, const BuiltCommand& c,
+                          int qubit) {
+  const int arity = circ.cmd_arity(c);
+  for (int p = 0; p < arity; ++p) {
+    if (circ.cmd_qubit(c, p) == qubit) return true;
+  }
+  return false;
 }
 
 // Mirrors `origin_of_start_proc`: the origin is stored alongside the command.
-inline const std::string& origin_of_start_proc(const BuiltCommand& c) {
+inline int origin_of_start_proc(const BuiltCommand& c) {
   return c.start_origin;
 }
 
 // Mirrors `requires_embedding_start_proc(commands)` where `commands` is the
 // slice `built_commands[begin:]`.
 inline bool requires_embedding_start_proc(
-    const std::vector<BuiltCommand>& commands, std::size_t begin) {
-  const std::string& target_link = commands[begin].qubits[1];
+    const BuiltCircuit& circ, const std::vector<BuiltCommand>& commands,
+    std::size_t begin) {
+  const int target_link = commands[begin].q1;
   for (std::size_t i = begin; i < commands.size(); ++i) {
     const BuiltCommand& g = commands[i];
-    if (g.op_type == kOpCU1 && qubit_in(g, target_link)) return true;
-    if (is_end_proc_cmd(g) && g.qubits[0] == target_link) return false;
+    if (g.op_type == kOpCU1 && cmd_has_qubit(circ, g, target_link)) return true;
+    if (is_end_proc_cmd(g) && g.q0 == target_link) return false;
   }
   throw std::runtime_error(
       "requires_embedding_start_proc: no conclusion reached");
@@ -291,14 +442,13 @@ inline bool requires_embedding_start_proc(
 // Mirrors `requires_embedding_end_proc(commands)` where `commands` is the
 // slice `built_commands[:end]`.
 inline bool requires_embedding_end_proc(
-    const std::vector<BuiltCommand>& commands, std::size_t end) {
-  const std::string& source_link = commands[end - 1].qubits[0];
+    const BuiltCircuit& circ, const std::vector<BuiltCommand>& commands,
+    std::size_t end) {
+  const int source_link = commands[end - 1].q0;
   for (std::size_t i = end; i-- > 0;) {
     const BuiltCommand& g = commands[i];
-    if (g.op_type == kOpCU1 && qubit_in(g, source_link)) return true;
-    if (is_start_proc_cmd(g) && g.qubits.size() > 1 &&
-        g.qubits[1] == source_link)
-      return false;
+    if (g.op_type == kOpCU1 && cmd_has_qubit(circ, g, source_link)) return true;
+    if (is_start_proc_cmd(g) && g.q1 == source_link) return false;
   }
   throw std::runtime_error(
       "requires_embedding_end_proc: no conclusion reached");
@@ -314,6 +464,7 @@ struct TPCContext {
   const std::map<int, int>& server_ebit_mem;
   bool satisfy_bound;
   std::vector<int> server_list;
+  TPCTables* tables;  // shared interning tables for this attempt
 
   const std::string& circuit_qubit_of_vertex(Vertex v) const {
     return hyp_circ.qubit_of_vertex(v);
@@ -335,28 +486,33 @@ inline std::map<std::string, std::string> build_qubit_mapping(
   return m;
 }
 
-// Mirrors the nested `LinkManager` class. `link_qubit_dict` is insertion
-// ordered (CPython dict semantics) — NOT a std::map — because
-// `connected_servers()` iterates its keys and drives `start_link` tie-breaks.
+// Mirrors the nested `LinkManager` class, operating on interned qubit ids.
+// `link_qubit_dict` is insertion ordered (CPython dict semantics) — NOT a
+// std::map — because `connected_servers()` iterates its keys and drives
+// `start_link` tie-breaks.
 struct LinkManager {
   const TPCContext& ctx;
+  BuiltCircuit& out;  // circuit being built; owns qubit interning + presence
   Hyperedge hyperedge;
-  std::vector<std::pair<int, std::string>> link_qubit_dict;
-  std::map<int, std::vector<std::string>> available;
-  std::map<int, std::vector<std::string>> occupied;
-  std::map<std::string, std::string> link_qubit_id_update;
+  int home_id = -1;  // hardware qubit id of the hyperedge's circuit qubit
+  std::vector<std::pair<int, int>> link_qubit_dict;  // (server, qubit id)
+  std::map<int, std::vector<int>> available;
+  std::map<int, std::vector<int>> occupied;
+  std::map<int, int> link_qubit_id_update;
   // `steiner_tree(server_graph, servers_of(hyperedge))` is the same for every
   // CU1 gate of this hyperedge, so compute it lazily once instead of once per
   // `start_link` call. Pure caching: the value is identical.
   std::optional<Graph> hyperedge_tree_cache;
 
   LinkManager(const TPCContext& ctx, const Hyperedge& h,
-              const std::vector<int>& servers)
-      : ctx(ctx), hyperedge(h) {
+              const std::vector<int>& servers, BuiltCircuit& out)
+      : ctx(ctx), out(out), hyperedge(h) {
     for (const int s : servers) {
       available[s] = {};
       occupied[s] = {};
     }
+    home_id = out.add_qubit(
+        ctx.qubit_mapping.at(ctx.circuit_qubit_of_vertex(qubit_vertex())));
   }
 
   const Graph& hyperedge_tree() {
@@ -379,8 +535,9 @@ struct LinkManager {
     return ctx.circuit_qubit_of_vertex(qubit_vertex());
   }
 
-  // Mirrors `_request_link_qubit`.
-  std::string request_link_qubit(int server) {
+  // Mirrors `_request_link_qubit`. Returns the qubit id (interning it into the
+  // circuit if a fresh link qubit is needed).
+  int request_link_qubit(int server) {
     int capacity = -1;
     auto it = ctx.server_ebit_mem.find(server);
     if (it != ctx.server_ebit_mem.end()) capacity = it->second;
@@ -395,11 +552,11 @@ struct LinkManager {
       }
     }
 
-    std::string qubit;
+    int qubit;
     if (available[server].empty()) {
       const int next_id = static_cast<int>(occupied[server].size());
-      qubit = "server_" + std::to_string(server) + "_link_register[" +
-              std::to_string(next_id) + "]";
+      qubit = out.add_qubit("server_" + std::to_string(server) +
+                            "_link_register[" + std::to_string(next_id) + "]");
     } else {
       qubit = available[server].back();
       available[server].pop_back();
@@ -409,8 +566,8 @@ struct LinkManager {
   }
 
   // Mirrors `_release_link_qubit`.
-  void release_link_qubit(const std::string& link_qubit) {
-    const int server = get_server_id(link_qubit);
+  void release_link_qubit(int link_qubit) {
+    const int server = out.qubit_server(link_qubit);
     auto& occ = occupied[server];
     occ.erase(std::find(occ.begin(), occ.end(), link_qubit));
     available[server].push_back(link_qubit);
@@ -418,15 +575,15 @@ struct LinkManager {
 
   // Mirrors `connected_servers()`: keys of link_qubit_dict in insertion order.
   std::vector<int> connected_servers() const {
-    std::vector<int> out;
+    std::vector<int> out_servers;
     for (const auto& [s, q] : link_qubit_dict) {
       (void)q;
-      out.push_back(s);
+      out_servers.push_back(s);
     }
-    return out;
+    return out_servers;
   }
 
-  void set_link_qubit(int server, const std::string& q) {
+  void set_link_qubit(int server, int q) {
     for (auto& [s, v] : link_qubit_dict) {
       if (s == server) {
         v = q;
@@ -446,9 +603,9 @@ struct LinkManager {
   }
 
   // Mirrors `get_link_qubit`.
-  std::string get_link_qubit(int server) const {
+  int get_link_qubit(int server) const {
     if (home_server() == server) {
-      return ctx.qubit_mapping.at(circuit_qubit());
+      return home_id;
     }
     for (const auto& [s, q] : link_qubit_dict) {
       if (s == server) return q;
@@ -457,7 +614,7 @@ struct LinkManager {
   }
 
   // Mirrors `start_link`: returns the list of EjppAction (from, to) pairs.
-  std::vector<std::pair<std::string, std::string>> start_link(int target) {
+  std::vector<std::pair<int, int>> start_link(int target) {
     const int q_vertex = qubit_vertex();
     const int home = ctx.placement.at(q_vertex);
     // Only depends on the hyperedge, so it is cached across `start_link` calls.
@@ -477,11 +634,11 @@ struct LinkManager {
     }
     // assert best_path is not None
 
-    std::vector<std::pair<std::string, std::string>> actions;
-    std::string last_link_qubit = get_link_qubit(best_path[0]);
+    std::vector<std::pair<int, int>> actions;
+    int last_link_qubit = get_link_qubit(best_path[0]);
     for (std::size_t i = 1; i < best_path.size(); ++i) {
       const int next_server = best_path[i];
-      const std::string this_link_qubit = request_link_qubit(next_server);
+      const int this_link_qubit = request_link_qubit(next_server);
       set_link_qubit(next_server, this_link_qubit);
       actions.push_back({last_link_qubit, this_link_qubit});
       last_link_qubit = this_link_qubit;
@@ -490,12 +647,12 @@ struct LinkManager {
   }
 
   // Mirrors `end_links`.
-  std::vector<std::pair<std::string, std::string>> end_links(
+  std::vector<std::pair<int, int>> end_links(
       const std::vector<int>& targets) {
-    const std::string home_link = ctx.qubit_mapping.at(circuit_qubit());
-    std::vector<std::pair<std::string, std::string>> actions;
+    const int home_link = home_id;
+    std::vector<std::pair<int, int>> actions;
     for (const int target : targets) {
-      const std::string target_link = get_link_qubit(target);
+      const int target_link = get_link_qubit(target);
       actions.push_back({target_link, home_link});
       release_link_qubit(target_link);
       erase_link_qubit(target);
@@ -504,40 +661,91 @@ struct LinkManager {
   }
 
   // Mirrors `update_occupation`.
-  void update_occupation(const std::string& link_qubit, bool starting) {
+  void update_occupation(int link_qubit, bool starting) {
     if (starting) {
-      const int server = get_server_id(link_qubit);
-      const std::string new_link_qubit = request_link_qubit(server);
+      const int server = out.qubit_server(link_qubit);
+      const int new_link_qubit = request_link_qubit(server);
       link_qubit_id_update[link_qubit] = new_link_qubit;
     } else {
-      const std::string new_link_qubit = link_qubit_id_update.at(link_qubit);
+      const int new_link_qubit = link_qubit_id_update.at(link_qubit);
       release_link_qubit(new_link_qubit);
     }
   }
 
   // Mirrors `get_updated_name`.
-  std::string get_updated_name(const std::string& q) const {
+  int get_updated_id(int q) const {
     auto it = link_qubit_id_update.find(q);
     if (it != link_qubit_id_update.end()) return it->second;
     return q;
   }
 };
 
-inline BuiltCommand mk_cmd(const std::string& name, int op_type,
-                           const std::vector<double>& params,
-                           const std::vector<std::string>& qubits,
-                           const std::string& origin = "") {
-  return BuiltCommand{name, op_type, params, qubits, origin};
+// Append a one-qubit gate command (`H`, `Rz`, ...).
+inline void push1(BuiltCircuit& c, int op, int op_type, int q,
+                  double param = 0.0, int n_params = 0) {
+  BuiltCommand cmd;
+  cmd.op = op;
+  cmd.op_type = op_type;
+  cmd.arity = 1;
+  cmd.q0 = q;
+  cmd.p0 = param;
+  cmd.n_params = n_params;
+  c.commands.push_back(cmd);
+}
+
+// Append a two-qubit gate command (`CU1`, `CZ`).
+inline void push2(BuiltCircuit& c, int op, int op_type, int q0, int q1,
+                  double param = 0.0, int n_params = 0) {
+  BuiltCommand cmd;
+  cmd.op = op;
+  cmd.op_type = op_type;
+  cmd.arity = 2;
+  cmd.q0 = q0;
+  cmd.q1 = q1;
+  cmd.p0 = param;
+  cmd.n_params = n_params;
+  c.commands.push_back(cmd);
+}
+
+// `starting_process(from, to)` with the compute qubit it copies.
+inline void push_start_proc(BuiltCircuit& c, int from, int to, int origin) {
+  BuiltCommand cmd;
+  cmd.op = c.tables->op_start;
+  cmd.op_type = kOpCustomGate;
+  cmd.flags = kCmdStartProc;
+  cmd.arity = 2;
+  cmd.q0 = from;
+  cmd.q1 = to;
+  cmd.start_origin = origin;
+  c.commands.push_back(cmd);
+}
+
+inline void push_end_proc(BuiltCircuit& c, int from, int to) {
+  BuiltCommand cmd;
+  cmd.op = c.tables->op_end;
+  cmd.op_type = kOpCustomGate;
+  cmd.flags = kCmdEndProc;
+  cmd.arity = 2;
+  cmd.q0 = from;
+  cmd.q1 = to;
+  c.commands.push_back(cmd);
 }
 
 // Copy a command verbatim, renaming its qubits through the LinkManager.
-inline BuiltCommand copy_cmd(const BuiltCommand& src, const LinkManager& lm) {
-  BuiltCommand out = src;
-  out.qubits.clear();
-  for (const std::string& q : src.qubits) {
-    out.qubits.push_back(lm.get_updated_name(q));
+inline BuiltCommand copy_cmd(BuiltCircuit& c, const BuiltCommand& src,
+                             const LinkManager& lm) {
+  BuiltCommand cmd = src;
+  if ((src.flags & kCmdBarrier) == 0) {
+    if (src.wide >= 0) {
+      std::vector<int> qs = c.tables->wide_qubits[src.wide];
+      for (int& q : qs) q = lm.get_updated_id(q);
+      cmd.wide = c.tables->intern_wide(std::move(qs));
+    } else {
+      if (cmd.arity > 0) cmd.q0 = lm.get_updated_id(src.q0);
+      if (cmd.arity > 1) cmd.q1 = lm.get_updated_id(src.q1);
+    }
   }
-  return out;
+  return cmd;
 }
 
 // Mirrors `to_pytket_circuit_one_hyperedge`.
@@ -548,15 +756,18 @@ inline BuiltCircuit one_hyperedge(const Hyperedge& hyperedge,
     return circ;
   }
 
-  BuiltCircuit new_circ;
+  TPCTables& T = *ctx.tables;
+  BuiltCircuit new_circ(ctx.tables);
   for (const auto& [orig, hw] : ctx.qubit_mapping) {
     (void)orig;
     new_circ.add_qubit(hw);
   }
 
   const Vertex q_vertex = ctx.hyp_circ.get_qubit_vertex(hyperedge);
-  const std::string src_qubit =
-      ctx.qubit_mapping.at(ctx.circuit_qubit_of_vertex(q_vertex));
+  // `add_qubit` is idempotent, so this also yields the id of an already-added
+  // hardware qubit.
+  const int src_qubit = new_circ.add_qubit(
+      ctx.qubit_mapping.at(ctx.circuit_qubit_of_vertex(q_vertex)));
 
   const std::vector<Vertex> gate_vertices =
       ctx.hyp_circ.get_gate_vertices(hyperedge);
@@ -568,7 +779,7 @@ inline BuiltCircuit one_hyperedge(const Hyperedge& hyperedge,
   int v_gate = static_cast<int>(ctx.qubit_mapping.size()) - 1;
   bool currently_h_embedding = false;
   double carry_phase = 0.0;
-  LinkManager lm(ctx, hyperedge, ctx.server_list);
+  LinkManager lm(ctx, hyperedge, ctx.server_list, new_circ);
 
   // Scan in pytket's `get_commands()` order (slices, within a slice by
   // UnitID), NOT insertion order. The reference iterates `circ.get_commands()`
@@ -588,17 +799,16 @@ inline BuiltCircuit one_hyperedge(const Hyperedge& hyperedge,
     // command, before the hyperedge-span early exit).
     if (is_start_proc_cmd(cmd)) {
       try {
-        lm.update_occupation(cmd.qubits[1], true);
+        lm.update_occupation(cmd.q1, true);
       } catch (ConstraintException& e) {
         e.v_gate = v_gate;
         throw;
       }
-      const std::string remote_qubit = lm.get_updated_name(cmd.qubits[1]);
-      new_circ.add_qubit(remote_qubit);
+      new_circ.add_qubit_id(lm.get_updated_id(cmd.q1));
     }
     if (is_end_proc_cmd(cmd)) {
       try {
-        lm.update_occupation(cmd.qubits[0], false);
+        lm.update_occupation(cmd.q0, false);
       } catch (ConstraintException& e) {
         e.v_gate = v_gate;
         throw;
@@ -612,36 +822,36 @@ inline BuiltCircuit one_hyperedge(const Hyperedge& hyperedge,
       if (cmd.op_type == kOpBarrier) {
         new_circ.push_barrier_over_all();
       } else {
-        new_circ.commands.push_back(copy_cmd(cmd, lm));
+        new_circ.commands.push_back(copy_cmd(new_circ, cmd, lm));
       }
       continue;
     }
 
     if (cmd.op_type == kOpRz) {
-      if (!qubit_in(cmd, src_qubit)) {
-        new_circ.commands.push_back(copy_cmd(cmd, lm));
+      if (!cmd_has_qubit(circ, cmd, src_qubit)) {
+        new_circ.commands.push_back(copy_cmd(new_circ, cmd, lm));
         continue;
       }
-      const std::string q = cmd.qubits[0];
-      const double phase = cmd.params[0];
-      new_circ.commands.push_back(mk_cmd("Rz", kOpRz, {phase}, {q}));
+      const int q = cmd.q0;
+      const double phase = cmd.p0;
+      push1(new_circ, T.op_rz, kOpRz, q, phase, 1);
       if (currently_h_embedding) {
         const double p1 = py_mod(phase, 1.0);
         if (isclose(p1, 0.0) || isclose(p1, 1.0)) {
           for (const int server : lm.connected_servers()) {
-            const std::string lq = lm.get_link_qubit(server);
-            new_circ.commands.push_back(mk_cmd("Rz", kOpRz, {phase}, {lq}));
+            push1(new_circ, T.op_rz, kOpRz, lm.get_link_qubit(server), phase,
+                  1);
           }
         } else {
           carry_phase += phase;
         }
       }
     } else if (cmd.op_type == kOpH) {
-      if (!qubit_in(cmd, src_qubit)) {
-        new_circ.commands.push_back(copy_cmd(cmd, lm));
+      if (!cmd_has_qubit(circ, cmd, src_qubit)) {
+        new_circ.commands.push_back(copy_cmd(new_circ, cmd, lm));
         continue;
       }
-      const std::string q = cmd.qubits[0];
+      const int q = cmd.q0;
 
       if (!currently_h_embedding) {
         // Detect whether this H opens an embedding unit with content.
@@ -649,22 +859,21 @@ inline BuiltCircuit one_hyperedge(const Hyperedge& hyperedge,
         const BuiltCommand* found_cmd = nullptr;
         for (std::size_t i = cmd_idx + 1; i < commands.size(); ++i) {
           const BuiltCommand& g = commands[i];
-          if (g.op_type == kOpCU1 && qubit_in(g, q)) {
+          if (g.op_type == kOpCU1 && cmd_has_qubit(circ, g, q)) {
             found_idx = static_cast<int>(i);
             found_cmd = &g;
             break;
           } else if (is_start_proc_cmd(g) && g.start_origin == q &&
-                     requires_embedding_start_proc(commands, i)) {
+                     requires_embedding_start_proc(circ, commands, i)) {
             found_idx = static_cast<int>(i);
             found_cmd = &g;
             break;
-          } else if (is_end_proc_cmd(g) && g.qubits.size() > 1 &&
-                     g.qubits[1] == q &&
-                     requires_embedding_end_proc(commands, i + 1)) {
+          } else if (is_end_proc_cmd(g) && g.q1 == q &&
+                     requires_embedding_end_proc(circ, commands, i + 1)) {
             found_idx = static_cast<int>(i);
             found_cmd = &g;
             break;
-          } else if (g.op_type == kOpH && qubit_in(g, q)) {
+          } else if (g.op_type == kOpH && cmd_has_qubit(circ, g, q)) {
             break;
           }
         }
@@ -672,44 +881,49 @@ inline BuiltCircuit one_hyperedge(const Hyperedge& hyperedge,
         if (found_cmd == nullptr) {
           // Case 1: empty embedding unit.
           for (const int server : lm.connected_servers()) {
-            const std::string lq = lm.get_link_qubit(server);
-            new_circ.commands.push_back(mk_cmd("H", kOpH, {}, {lq}));
+            push1(new_circ, T.op_h, kOpH, lm.get_link_qubit(server));
           }
           currently_h_embedding = true;
         } else {
           // Case 2: embedding unit with content; keep only the remote server.
-          std::string remote_qubit;
+          int remote_qubit = -1;
           if (is_start_proc_cmd(*found_cmd)) {
-            remote_qubit = found_cmd->qubits[1];
+            remote_qubit = found_cmd->q1;
           } else {
-            for (const std::string& rq : found_cmd->qubits) {
+            const int arity = circ.cmd_arity(*found_cmd);
+            for (int p = 0; p < arity; ++p) {
+              const int rq = circ.cmd_qubit(*found_cmd, p);
               if (rq != q) remote_qubit = rq;
             }
           }
-          if (found_cmd->op_type == kOpCU1 && is_link_qubit(remote_qubit)) {
-            std::string original_remote;
+          if (found_cmd->op_type == kOpCU1 &&
+              new_circ.qubit_is_link(remote_qubit)) {
+            int original_remote = -1;
             for (std::size_t j = static_cast<std::size_t>(found_idx);
                  j < commands.size(); ++j) {
               const BuiltCommand& g = commands[j];
-              if (is_end_proc_cmd(g) && g.qubits[0] == remote_qubit) {
-                original_remote = g.qubits[1];
+              if (is_end_proc_cmd(g) && g.q0 == remote_qubit) {
+                original_remote = g.q1;
                 break;
               }
             }
+            if (original_remote < 0) {
+              throw std::runtime_error(
+                  "implementation of hyperedge failed: ending_process for a "
+                  "link qubit was not found");
+            }
             remote_qubit = original_remote;
           }
-          const int remote_server = get_server_id(remote_qubit);
+          const int remote_server = new_circ.qubit_server(remote_qubit);
           std::vector<int> end_servers;
           for (const int s : lm.connected_servers()) {
             if (s != remote_server) end_servers.push_back(s);
           }
           for (const auto& [from, to] : lm.end_links(end_servers)) {
-            new_circ.commands.push_back(
-                mk_cmd("ending_process", kOpCustomGate, {}, {from, to}));
+            push_end_proc(new_circ, from, to);
           }
           for (const int server : lm.connected_servers()) {
-            const std::string lq = lm.get_link_qubit(server);
-            new_circ.commands.push_back(mk_cmd("H", kOpH, {}, {lq}));
+            push1(new_circ, T.op_h, kOpH, lm.get_link_qubit(server));
           }
           currently_h_embedding = true;
         }
@@ -721,17 +935,15 @@ inline BuiltCircuit one_hyperedge(const Hyperedge& hyperedge,
           // I gate: end embedding with H.
           currently_h_embedding = false;
           for (const int server : lm.connected_servers()) {
-            const std::string lq = lm.get_link_qubit(server);
-            new_circ.commands.push_back(mk_cmd("H", kOpH, {}, {lq}));
+            push1(new_circ, T.op_h, kOpH, lm.get_link_qubit(server));
           }
         } else if (isclose(m2, 1.0)) {
           // Z gate: end embedding with Rz + H.
           currently_h_embedding = false;
           for (const int server : lm.connected_servers()) {
-            const std::string lq = lm.get_link_qubit(server);
-            new_circ.commands.push_back(
-                mk_cmd("Rz", kOpRz, {carry_phase}, {lq}));
-            new_circ.commands.push_back(mk_cmd("H", kOpH, {}, {lq}));
+            const int lq = lm.get_link_qubit(server);
+            push1(new_circ, T.op_rz, kOpRz, lq, carry_phase, 1);
+            push1(new_circ, T.op_h, kOpH, lq);
           }
           carry_phase = 0.0;
         } else if (isclose(m1, 0.5)) {
@@ -744,16 +956,20 @@ inline BuiltCircuit one_hyperedge(const Hyperedge& hyperedge,
               "embedding with an internal phase that cannot be cancelled.");
         }
       }
-      new_circ.commands.push_back(mk_cmd("H", kOpH, {}, {q}));
+      push1(new_circ, T.op_h, kOpH, q);
     } else if (cmd.op_type == kOpCU1) {
-      if (!qubit_in(cmd, src_qubit)) {
-        new_circ.commands.push_back(copy_cmd(cmd, lm));
+      if (!cmd_has_qubit(circ, cmd, src_qubit)) {
+        new_circ.commands.push_back(copy_cmd(new_circ, cmd, lm));
         continue;
       }
-      const double phase = cmd.params[0];
-      std::string rmt_qubit;
-      for (const std::string& q : cmd.qubits) {
-        if (q != src_qubit) rmt_qubit = q;
+      const double phase = cmd.p0;
+      int rmt_qubit = -1;
+      {
+        const int arity = circ.cmd_arity(cmd);
+        for (int p = 0; p < arity; ++p) {
+          const int q = circ.cmd_qubit(cmd, p);
+          if (q != src_qubit) rmt_qubit = q;
+        }
       }
 
       if (std::find(hyperedge.vertices.begin(), hyperedge.vertices.end(),
@@ -762,7 +978,7 @@ inline BuiltCircuit one_hyperedge(const Hyperedge& hyperedge,
         // assert !currently_h_embedding
         const int target_server = ctx.placement.at(v_gate);
 
-        std::vector<std::pair<std::string, std::string>> start_actions;
+        std::vector<std::pair<int, int>> start_actions;
         try {
           start_actions = lm.start_link(target_server);
         } catch (ConstraintException& e) {
@@ -770,78 +986,74 @@ inline BuiltCircuit one_hyperedge(const Hyperedge& hyperedge,
           throw;
         }
         for (const auto& [from, to] : start_actions) {
-          new_circ.add_qubit(to);
-          new_circ.commands.push_back(
-              mk_cmd("starting_process_" + src_qubit, kOpCustomGate, {},
-                     {from, to}, src_qubit));
+          push_start_proc(new_circ, from, to, src_qubit);
         }
-        new_circ.commands.push_back(
-            mk_cmd("CU1", kOpCU1, {phase},
-                   {lm.get_link_qubit(target_server),
-                    lm.get_updated_name(rmt_qubit)}));
+        push2(new_circ, T.op_cu1, kOpCU1, lm.get_link_qubit(target_server),
+              lm.get_updated_id(rmt_qubit), phase, 1);
 
         if (v_gate == max_gv) {
           for (const auto& [from, to] :
                lm.end_links(lm.connected_servers())) {
-            new_circ.commands.push_back(
-                mk_cmd("ending_process", kOpCustomGate, {}, {from, to}));
+            push_end_proc(new_circ, from, to);
           }
         }
       } else {
-        new_circ.commands.push_back(copy_cmd(cmd, lm));
+        new_circ.commands.push_back(copy_cmd(new_circ, cmd, lm));
         if (currently_h_embedding) {
           const double p1 = py_mod(phase, 1.0);
           (void)p1;  // assert isclose(p1,0) or isclose(p1,1)
-          if (is_link_qubit(rmt_qubit)) {
-            std::string original_remote;
+          if (new_circ.qubit_is_link(rmt_qubit)) {
+            int original_remote = -1;
             for (std::size_t j = cmd_idx; j < commands.size(); ++j) {
               const BuiltCommand& g = commands[j];
-              if (is_end_proc_cmd(g) && g.qubits[0] == rmt_qubit) {
-                original_remote = g.qubits[1];
+              if (is_end_proc_cmd(g) && g.q0 == rmt_qubit) {
+                original_remote = g.q1;
                 break;
               }
+            }
+            if (original_remote < 0) {
+              throw std::runtime_error(
+                  "implementation of hyperedge failed: ending_process for a "
+                  "link qubit was not found");
             }
             rmt_qubit = original_remote;
           }
           for (const int server : lm.connected_servers()) {
-            const std::string lq = lm.get_link_qubit(server);
-            new_circ.commands.push_back(
-                mk_cmd("CZ", kOpCZ, {}, {lq, rmt_qubit}));
+            push2(new_circ, T.op_cz, kOpCZ, lm.get_link_qubit(server),
+                  rmt_qubit);
           }
         }
       }
     } else if (is_start_proc_cmd(cmd)) {
-      const std::string& orig_qubit = cmd.start_origin;
-      const std::string remote_qubit = lm.get_updated_name(cmd.qubits[1]);
-      new_circ.commands.push_back(copy_cmd(cmd, lm));
+      const int orig_qubit = cmd.start_origin;
+      const int remote_qubit = lm.get_updated_id(cmd.q1);
+      new_circ.commands.push_back(copy_cmd(new_circ, cmd, lm));
       if (currently_h_embedding && src_qubit == orig_qubit) {
-        if (requires_embedding_start_proc(commands, cmd_idx)) {
+        if (requires_embedding_start_proc(circ, commands, cmd_idx)) {
           for (const int server : lm.connected_servers()) {
-            const std::string lq = lm.get_link_qubit(server);
-            new_circ.commands.push_back(mk_cmd("H", kOpH, {}, {remote_qubit}));
-            new_circ.commands.push_back(
-                mk_cmd("CZ", kOpCZ, {}, {remote_qubit, lq}));
-            new_circ.commands.push_back(mk_cmd("H", kOpH, {}, {remote_qubit}));
+            const int lq = lm.get_link_qubit(server);
+            push1(new_circ, T.op_h, kOpH, remote_qubit);
+            push2(new_circ, T.op_cz, kOpCZ, remote_qubit, lq);
+            push1(new_circ, T.op_h, kOpH, remote_qubit);
           }
         }
       }
     } else if (is_end_proc_cmd(cmd)) {
-      const std::string orig_qubit = lm.get_updated_name(cmd.qubits[1]);
-      const std::string remote_qubit = lm.get_updated_name(cmd.qubits[0]);
+      const int orig_qubit = lm.get_updated_id(cmd.q1);
+      const int remote_qubit = lm.get_updated_id(cmd.q0);
       if (currently_h_embedding && src_qubit == orig_qubit) {
-        if (requires_embedding_end_proc(commands, cmd_idx + 1)) {
+        if (requires_embedding_end_proc(circ, commands, cmd_idx + 1)) {
           for (const int server : lm.connected_servers()) {
-            const std::string lq = lm.get_link_qubit(server);
-            new_circ.commands.push_back(mk_cmd("H", kOpH, {}, {remote_qubit}));
-            new_circ.commands.push_back(
-                mk_cmd("CZ", kOpCZ, {}, {remote_qubit, lq}));
-            new_circ.commands.push_back(mk_cmd("H", kOpH, {}, {remote_qubit}));
+            const int lq = lm.get_link_qubit(server);
+            push1(new_circ, T.op_h, kOpH, remote_qubit);
+            push2(new_circ, T.op_cz, kOpCZ, remote_qubit, lq);
+            push1(new_circ, T.op_h, kOpH, remote_qubit);
           }
         }
       }
-      new_circ.commands.push_back(copy_cmd(cmd, lm));
+      new_circ.commands.push_back(copy_cmd(new_circ, cmd, lm));
     } else if (cmd.op_type == kOpCZ) {
-      new_circ.commands.push_back(copy_cmd(cmd, lm));
+      new_circ.commands.push_back(copy_cmd(new_circ, cmd, lm));
     } else if (cmd.op_type == kOpBarrier) {
       // Mirror the reference: re-add the barrier over all qubits currently in
       // the circuit. Barriers are scaffolding only (removed from the emitted
@@ -1004,13 +1216,18 @@ inline ToPytketCircuitResult to_pytket_circuit(Distribution& dist,
   while (true) {
     std::map<std::string, std::string> qubit_mapping =
         tpc_internal::build_qubit_mapping(dist);
+    // Interning tables for this attempt: `new_circ`, every per-hyperedge
+    // circuit derived from it and the checkpoints all share them, so ids stay
+    // valid across copies and rollbacks.
+    tpc_internal::TPCTables tables;
+    tables.init_std();
     tpc_internal::TPCContext ctx{
         dist.circuit,      dist.placement,
         dist.server_graph, qubit_mapping,
         dist.server_ebit_mem, satisfy_bound,
-        dist.get_server_list()};
+        dist.get_server_list(), &tables};
 
-    tpc_internal::BuiltCircuit new_circ;
+    tpc_internal::BuiltCircuit new_circ(&tables);
     for (const auto& [orig, hw] : qubit_mapping) {
       (void)orig;
       new_circ.add_qubit(hw);
@@ -1020,13 +1237,33 @@ inline ToPytketCircuitResult to_pytket_circuit(Distribution& dist,
     // pin the CU1 ordering so pytket's `get_commands()` is deterministic.
     for (const Command& cmd : dist.circuit.get_circuit().commands) {
       tpc_internal::BuiltCommand out;
-      out.op_name = cmd.op_name;
+      out.op = tables.ops.intern(cmd.op_name);
       out.op_type = cmd.op_type;
-      out.params = cmd.params;
-      for (const std::string& q : cmd.qubits) {
-        out.qubits.push_back(qubit_mapping.at(q));
+      if (cmd.op_name.rfind("starting_process", 0) == 0) {
+        out.flags |= tpc_internal::kCmdStartProc;
+      } else if (cmd.op_name.rfind("ending_process", 0) == 0) {
+        out.flags |= tpc_internal::kCmdEndProc;
       }
-      new_circ.commands.push_back(std::move(out));
+      std::vector<int> qids;
+      qids.reserve(cmd.qubits.size());
+      for (const std::string& q : cmd.qubits) {
+        qids.push_back(new_circ.add_qubit(qubit_mapping.at(q)));
+      }
+      if (qids.size() <= 2) {
+        out.arity = static_cast<std::uint8_t>(qids.size());
+        if (!qids.empty()) out.q0 = qids[0];
+        if (qids.size() > 1) out.q1 = qids[1];
+      } else {
+        out.arity = 0;
+        out.wide = tables.intern_wide(std::move(qids));
+      }
+      out.n_params = static_cast<int>(cmd.params.size());
+      if (!cmd.params.empty()) out.p0 = cmd.params[0];
+      if (cmd.params.size() > 1) out.p1 = cmd.params[1];
+      if (cmd.params.size() > 2) {
+        out.params_idx = tables.intern_params(cmd.params);
+      }
+      new_circ.commands.push_back(out);
       if (cmd.op_type == kOpCU1) {
         new_circ.push_barrier_over_all();
       }
@@ -1089,18 +1326,28 @@ inline ToPytketCircuitResult to_pytket_circuit(Distribution& dist,
     }
 
     SerializedCircuit out;
-    out.qubits = new_circ.qubits;
+    out.qubits.reserve(new_circ.qubit_order.size());
+    for (const int id : new_circ.qubit_order) {
+      out.qubits.push_back(new_circ.qubit_name(id));
+    }
     for (const tpc_internal::BuiltCommand& c : new_circ.commands) {
       if (c.op_type == kOpBarrier) continue;  // barriers are scaffolding only
+      std::vector<std::string> qs;
+      const int arity = new_circ.cmd_arity(c);
+      qs.reserve(arity);
+      for (int p = 0; p < arity; ++p) {
+        qs.push_back(new_circ.qubit_name(new_circ.cmd_qubit(c, p)));
+      }
       Command oc;
       if (c.op_type == kOpCZ) {
-        oc = Command{"CU1", c.qubits, kOpCU1, {1.0}};
+        oc = Command{"CU1", std::move(qs), kOpCU1, {1.0}};
       } else if (tpc_internal::is_start_proc_cmd(c)) {
-        oc = Command{"starting_process", c.qubits, kOpCustomGate, {}};
+        oc = Command{"starting_process", std::move(qs), kOpCustomGate, {}};
       } else if (tpc_internal::is_end_proc_cmd(c)) {
-        oc = Command{"ending_process", c.qubits, kOpCustomGate, {}};
+        oc = Command{"ending_process", std::move(qs), kOpCustomGate, {}};
       } else {
-        oc = Command{c.op_name, c.qubits, c.op_type, c.params};
+        oc = Command{new_circ.op_name(c.op), std::move(qs), c.op_type,
+                     new_circ.params_of(c)};
       }
       out.commands.push_back(std::move(oc));
     }

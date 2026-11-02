@@ -70,10 +70,12 @@ Supporting pieces:
   `hyp_circ.index_in_list(chosen)` **before** splitting — the same index
   `split_hyperedge` uses, so "earlier hyperedges are untouched" is guaranteed
   even if two hyperedges compare equal.
-- `BuiltCircuitSnapshot` stores only `qubits` (first-seen order) and `commands`
-  (add order). `BuiltCircuit::restore()` reinstates them and calls
-  `rebuild_dag()`; the DAG, `qubit_ids` and wire/frontier bookkeeping are pure
-  functions of that state, so nothing derived is stored.
+- `BuiltCircuitSnapshot` stores only `qubit_order` (qubit ids, first-seen order)
+  and `commands` (add order). `BuiltCircuit::restore()` reinstates them, rebuilds
+  the `present` mask and calls `rebuild_dag()`; the DAG and wire/frontier
+  bookkeeping are pure functions of that state, so nothing derived is stored.
+  The interning tables (see change 5) are append-only for a whole attempt, so the
+  ids inside a checkpoint's commands stay valid after a rollback.
 - `kResumeStride = 8`: a snapshot is taken every 8 hyperedges, bounding rollback
   memory to `K/8` copies of the command list while adding at most a few replayed
   hyperedges per split. (Stride 1 and 4 were measured and are not meaningfully
@@ -102,6 +104,61 @@ hyperedge contains only its qubit vertex. The C++ builder implemented that as
 `return circ;`, i.e. a **deep copy of the entire `BuiltCircuit`** (commands,
 vertices, wires) for every such hyperedge. The caller now skips them.
 
+## Change 4 — epoch-stamped command ordering
+
+`get_commands_order()` runs once per hyperedge and walks the intermediate circuit
+in pytket's slice order. Because the builder inserts a full barrier after every
+CU1, there is roughly **one slice per CU1 gate**, and each slice used to do:
+
+```cpp
+std::vector<int> all_edges;                       // fresh allocation
+in_edge.assign(wires.size(), 0);                  // zero the whole wire array
+std::fill(in_slice.begin(), in_slice.end(), 0);   // zero the whole vertex array
+std::fill(bad.begin(), bad.end(), 0);
+```
+
+The wire array is `O(#commands × arity)` (and barriers are `O(#qubits)` wide), so
+this zeroing dominated the whole build: 8.6 × 10⁹ array cells on the 16-qubit
+case and 8.9 × 10¹⁰ at 20 qubits. The three scratch vectors are now persistent
+`mutable` members of `BuiltCircuit` and are cleared with a **monotonic epoch**
+instead of being zeroed (`stamp[x] == epoch` tests), so a slice costs
+`O(#qubits + gates in slice)` instead of `O(circuit size)`. `all_edges` is gone
+(the slice order is read straight from `qubit_order`), and `qubit_index()` —
+previously an `O(Q)` scan with `std::string` comparisons, called per qubit in
+every DAG rebuild — is now an `std::unordered_map` maintained by
+`add_qubit()`/`restore()`.
+
+## Change 5 — interned, trivially copyable commands
+
+`BuiltCommand` used to hold `std::string op_name`, `std::vector<double> params`,
+`std::vector<std::string> qubits` and `std::string start_origin`, so every
+hyperedge deep-copied the whole command list (3.6 M copies at 16 qubits, 12.5 M
+at 20) and `copy_cmd` renamed qubits through a
+`std::map<std::string, std::string>`. `is_link_qubit()`/`get_server_id()` also
+re-parsed the qubit name (allocating a `vector<string>` of substrings) on every
+call.
+
+Commands are now **interned**:
+
+- `BuiltCommand` is a flat struct of ints/doubles — `op` (interned op-name id),
+  qubit **ids**, `p0`/`p1`, `start_origin`, plus escape hatches (`wide` for
+  commands with more than two qubits, `params_idx` for more than two parameters)
+  and `barrier_n`/`flags`. Copying one is a `memcpy`, with no allocation.
+- `TPCTables` (shared by every circuit of an attempt via `TPCContext::tables`)
+  owns the `QubitTable` (name → id, plus the parsed `UnitID`, server id and
+  link-qubit flag, computed once at intern time) and the `OpTable`.
+- `BuiltCircuit` is keyed by ids: `qubit_order`, a dense `present` mask and
+  `cmd_arity()`/`cmd_qubit()` accessors. `LinkManager` holds ids too
+  (`get_updated_id`, `link_qubit_dict`, `available`/`occupied`).
+- Barriers store `barrier_n`, the length of the `qubit_order` prefix they cover
+  (the order is append-only), so `push_barrier_over_all()` is `O(1)` instead of
+  copying every qubit name. They remain full barrier vertices in the DAG, so the
+  slice structure — and therefore the emitted order — is unchanged.
+
+The tables are append-only for the whole attempt, which is what makes it safe to
+move commands between circuits and to roll back to a checkpoint without
+re-interning anything.
+
 ## Measured runtime
 
 Configuration: QFT on `P = 4` fully connected QPUs (`server_ebit_mem = 2`),
@@ -110,26 +167,40 @@ Configuration: QFT on `P = 4` fully connected QPUs (`server_ebit_mem = 2`),
 `PYTHONHASHSEED=12345`.
 
 **Core only** — a standalone driver linked against the header-only library
-(`-O2`), consuming *the same* distribution before and after the change, so the
+(`-O3`), consuming *the same* distribution before and after the change, so the
 numbers isolate the algorithm:
 
 | circuit | source cmds | hyperedges (initial → after splits) | before | after | speed-up | emitted circuit |
 | --- | --- | --- | --- | --- | --- | --- |
-| QFT 16 | 136 | 30 → 167 | 10.0 s | **2.3 s** | 4.3× | 352 cmds, 21 qubits, ebit 108 |
-| QFT 20 | 210 | 38 → 295 | 79.2 s | **17.0 s** | 4.7× | 584 cmds, 24 qubits, ebit 187 |
-| QFT 24 | 300 | 46 → 411 | 304.4 s | **41.4 s** | 7.3× | 818 cmds, 29 qubits, ebit 259 |
+| QFT 16 | 136 | 30 → 167 | 10.0 s | **0.50 s** | 20× | 352 cmds, 21 qubits, ebit 108 |
+| QFT 20 | 210 | 38 → 295 | 79.2 s | **2.8 s** | 28× | 584 cmds, 24 qubits, ebit 187 |
+| QFT 24 | 300 | 46 → 411 | 304.4 s | **5.5 s** | 55× | 818 cmds, 29 qubits, ebit 259 |
+
+Changes 1–3 (resume, Steiner cache, size-1 skip) brought those three cases to
+2.3 s / 17.0 s / 41.4 s; changes 4–5 removed another 4–8× on top of that, and the
+gain grows with circuit size because the terms they remove (per-slice array
+clearing, string-carrying command copies) scale with the circuit, not with the
+number of hyperedges.
 
 **End to end through the Python adapter** (`pytket_dqc_cpp.Distribution.to_pytket_circuit`,
 including the Python↔C++ conversion and the pytket circuit rebuild):
 
 | circuit | before | after |
 | --- | --- | --- |
-| QFT 16 | 11.2 s | **4.1 s** |
-| QFT 20 | 69.5 s | **17.6 s** |
-| QFT 24 | not measured end to end (core alone: 304.4 s) | **38.7 s** |
+| QFT 16 | 11.2 s | **2.3 s** |
+| QFT 20 | 69.5 s | **4.5 s** |
+| QFT 24 | not measured end to end (core alone: 304.4 s) | **7.3 s** |
 
-The speed-up grows with size because the removed work scales as the number of
-restarts × suffix length; both grow with the circuit.
+As an independent cross-check, the timings recorded by
+`tests/python/check_qft_equivalence.py` for the many-QPUs AESD pipeline (the same
+circuit family, `num_partitions = num_qubits / 3`) put the reference Python
+package at 1.78 s / 17.2 s / 54.2 s / 345.5 s for 9 / 12 / 15 / 18 qubits and this
+port at 0.015 s / 0.084 s / 0.255 s / 1.07 s.
+
+The speed-up grows with size because the removed work scales with the circuit:
+change 1 factors out the restarts × suffix length, and changes 4–5 remove
+per-slice and per-command costs that grow with the circuit length and with the
+number of link qubits.
 
 ## Equivalence with the reference
 
@@ -150,28 +221,31 @@ labels. "Identical hyperedge set" means the resume logic performed exactly the
 reference's sequence of splits.
 
 Regression suites also pass unchanged: `ctest` (89/89), `pytest -m "not
-high_compute"` (152 passed, 7 skipped) and `tests/python/check_equivalence.py`
-(`ALL CHECKS PASSED`, which includes the exact-circuit `to_pytket_circuit`
-cases and `qft_distribution_pipelines`).
+high_compute"` (152 passed, 7 skipped), `pytest -m high_compute` (7 passed),
+`tests/python/check_equivalence.py` under `PYTHONHASHSEED` 12345 and 0 (`ALL
+CHECKS PASSED`, which includes the exact-circuit `to_pytket_circuit` cases and
+`qft_distribution_pipelines`), the adapter differential (894 checks × 4 seeds)
+and `tests/python/check_qft_equivalence.py`.
 
 ## What is still slow (next steps)
 
-The remaining cost is the per-hyperedge full rebuild, which the resume change
-does not address:
+A full pass over the final hypergraph now costs ~0.27 s (QFT 24, 411 hyperedges,
+818 emitted commands), split roughly as `get_commands_order()` ~45 %,
+`rebuild_dag()` ~45 % and the scan loop ~5 %; the build as a whole is ~9 300
+`one_hyperedge` calls because checkpoint replay redoes the affected suffix.
 
-- `get_commands_order()` is `O(#slices × #wires)`: it re-allocates and zeroes
-  scanner arrays for every slice. A barrier is inserted after every CU1 and
-  `push_barrier_over_all()` spans *all* qubits (link registers included), so
-  there is roughly one slice per CU1 and the wire count grows with the number of
-  link qubits.
-- `rebuild_dag()` re-creates every vertex and two wires per (command, qubit),
-  with `qubit_index()` doing a linear `std::string` scan per lookup.
-- `BuiltCommand` copies carry `std::string` and two `std::vector`s; each
-  hyperedge re-emits the whole command list.
+The two remaining structural costs are:
 
-Removing those (epoch-stamped scanners, integer qubit ids, barrier
-version-counters, an interned command arena) is the next step to make the cost
-`O(K · C)` instead of `O(K · C · Q)` with a much smaller constant.
+- `rebuild_dag()` still materialises two wires per qubit for every barrier
+  command, and barriers span every qubit (link registers included) — they are
+  ~55 % of the DAG rebuild time and ~74 % of all wires. Representing a barrier as
+  a per-qubit frontier version instead of a vertex with `O(#qubits)` wires would
+  remove that.
+- `get_commands_order()` is still recomputed from scratch for every hyperedge,
+  although each hyperedge only appends commands inside its own span. Maintaining
+  the slice sequence incrementally would turn the per-hyperedge `O(C)` order scan
+  into `O(span)`, and a persistent-DAG/undo-log design would remove the
+  per-hyperedge full circuit copy as well.
 
 ## Note for developers
 

@@ -133,7 +133,7 @@ As this project is mainly intended to be used to replace pytket-dqc for the QFT 
 
 It runs two benchmarks `tests/python/qft/main_*_qpus_*.py` through the reference Python package and this C++ accelerated package. They write their results to `tests/python/qft/results_*_qpus_*/` and the two `plot_*.py` scripts turn each variant's results into bar charts for easy human visualization (pass `--cpp` to plot the C++ variant).
 
-The checker runs all four drivers under `PYTHONHASHSEED=12345` (override with `QFT_PYTHONHASHSEED`), compares the result files field by field **ignoring the two timing lines**, regenerates the plots for both variants, and exits non-zero if anything differs. Use `--skip-computation` to reuse the existing result files (the plots and the comparison still run), and `--skip-plots` to skip plotting. The generated `.txt`/`.png` files are gitignored.
+The checker runs all four drivers under `PYTHONHASHSEED=12345` (override with `QFT_PYTHONHASHSEED`), compares the result files field by field **ignoring the two timing lines**, regenerates the plots for both variants, and exits non-zero if anything differs. Use `--skip-computation` to reuse the existing result files (the plots and the comparison still run), `--skip-python-computation` to run only the C++ drivers (comparing them against the existing Python result files), and `--skip-plots` to skip plotting. The generated `.txt`/`.png` files are gitignored.
 
 ## 3. Adapter suite: vendored regression tests
 
@@ -205,9 +205,14 @@ violation and then rebuilds the whole circuit from scratch, which makes the cost
 grow as (#restarts × circuit length) — 138 rebuilds and ~11 000 hyperedge passes
 on a 16-qubit QFT distribution. The C++ port keeps the reference's exact split
 sequence but resumes from the split point instead of restarting, caches the
-Steiner tree per hyperedge, and skips no-op (qubit-only) hyperedges. Measured on
-the QFT benchmark (4 QPUs, memory bound 2, core only): 10.0 s → 2.3 s (QFT 16),
-79.2 s → 17.0 s (QFT 20), 304.4 s → 41.4 s (QFT 24), with byte-identical output.
+Steiner tree per hyperedge, skips no-op (qubit-only) hyperedges, orders commands
+with epoch-stamped slice scanners, and keeps commands in interned (trivially
+copyable) form. Measured on the QFT benchmark (4 QPUs, memory bound 2):
+**core only** 10.0 s → 0.50 s (QFT 16), 79.2 s → 2.8 s (QFT 20), 304.4 s → 5.5 s
+(QFT 24); **end to end through the adapter** (including the Python↔C++ conversion
+and the pytket circuit rebuild) 11.2 s → 2.3 s (QFT 16) and 69.5 s → 4.5 s
+(QFT 20), with QFT 24 at 7.3 s end to end (pre-change core-only: 304.4 s). Output
+is byte-identical to the reference.
 See [`to_pytket_circuit_performance.md`](to_pytket_circuit_performance.md) for the
 algorithmic details, the measurement method, the equivalence evidence and the
 remaining hot spots.
