@@ -35,6 +35,7 @@ def plot_results(variant="py"):
     qubit_counts = {method:[] for method in method_names}
     partition_counts = {method:[] for method in method_names}
     e_bit_counts = {method:[] for method in method_names}
+    e_bit_counts_post = {method:[] for method in method_names}
     times = {method:[] for method in method_names}
     times_fixing = {method:[] for method in method_names}
     
@@ -57,6 +58,9 @@ def plot_results(variant="py"):
                 elif "Min e-bit count" in line:
                     e_bit_count = int(line.split(":")[1].strip())
                     e_bit_counts[method_name].append(e_bit_count)
+                elif "Post-extraction e-bit count" in line:
+                    e_bit_count_post = int(line.split(":")[1].strip())
+                    e_bit_counts_post[method_name].append(e_bit_count_post)
                 elif "Time taken" in line:
                     time = float(line.split(":")[1].split()[0].strip())
                     times[method_name].append(time)
@@ -75,15 +79,28 @@ def plot_results(variant="py"):
     width = 1 / (len(method_names)+1)  # the width of the bars
     figsize=(width*len(partition_counts)*20, 5)
 
-    # Plot e-bit count vs num_qubits
+    # Plot e-bit count vs num_qubits, stacked like the times: the bottom
+    # segment is the pre-extraction cost and the upper segment is the
+    # e-bits added by circuit extraction, so the bar height is the
+    # post-extraction (total) e-bit count.
     plt.figure(figsize=figsize)
     for i, (method, e_bit_count) in enumerate(e_bit_counts.items()):
         offset = width * i
-        rects = plt.bar(x + offset, e_bit_count, width, label=method)
-        plt.bar_label(rects, padding=3)
+        color = plt.cm.tab10(i % 10)
+        post = e_bit_counts_post[method]
+        rects = plt.bar(x + offset, e_bit_count, width, label=method, color=color)
+        if len(post) == len(e_bit_count):
+            e_bit_count_added = [max(0, p - pre) for pre, p in zip(e_bit_count, post)]
+            lower_labels = [pre if added >= 2 else "" for pre, added in zip(e_bit_count, e_bit_count_added)]
+            plt.bar_label(rects, labels=lower_labels, padding=3)
+            rects = plt.bar(x + offset, e_bit_count_added, width, bottom=e_bit_count, color=color, alpha=0.45)
+            plt.bar_label(rects, padding=3)
+        else:
+            # The result files do not record a post-extraction count.
+            plt.bar_label(rects, padding=3)
     plt.xlabel("Number of QPUs")
     plt.ylabel("Min E-bit Count")
-    plt.title(f"E-bit Count vs. Number of {qpu_size}-qubit QPUs")
+    plt.title(f"E-bit Count (distribution + extraction overhead) vs. Number of {qpu_size}-qubit QPUs")
     plt.xticks(x, partition_counts)
     plt.legend(loc='upper left', ncols=len(method_names))
     plt.legend()
@@ -100,9 +117,13 @@ def plot_results(variant="py"):
             return str(int(f))
     for i, (method, time) in enumerate(times.items()):
         offset = width * i
-        rects = plt.bar(x + offset, time, width, label=method)
-        plt.bar_label(rects, fmt=formatter, padding=3)
-        rects = plt.bar(x + offset, times_fixing[method], width, label=method, bottom=time)
+        color = plt.cm.tab10(i % 10)
+        # The upper label shows the cumulative total, so only print the
+        # lower label when the two values are at least 2 apart.
+        lower_labels = [formatter(t) if tf >= 2 else "" for t, tf in zip(time, times_fixing[method])]
+        rects = plt.bar(x + offset, time, width, label=method, color=color)
+        plt.bar_label(rects, labels=lower_labels, padding=3)
+        rects = plt.bar(x + offset, times_fixing[method], width, bottom=time, color=color, alpha=0.45)
         plt.bar_label(rects, fmt=formatter, padding=3)
     plt.xlabel("Number of QPUs")
     plt.ylabel("Time (seconds)")
