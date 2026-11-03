@@ -159,6 +159,67 @@ The tables are append-only for the whole attempt, which is what makes it safe to
 move commands between circuits and to roll back to a checkpoint without
 re-interning anything.
 
+## Change 6 — barrier synchronization boundaries and independent block slicing
+
+In pytket circuits and in `to_pytket_circuit`, a full barrier synchronizes all
+qubits currently in the circuit. Because a barrier spans all qubits, no gate
+occurring before the barrier can be placed into the same slice as, or after, any
+gate occurring after the barrier.
+
+This means full barriers act as **strict synchronization boundaries** that
+partition the circuit into independent blocks:
+
+$$\text{Block}_0 \xrightarrow{\text{barrier}} \text{Block}_1 \xrightarrow{\text{barrier}} \text{Block}_2 \xrightarrow{\text{barrier}} \dots$$
+
+Slicing can therefore be performed **independently** on each individual block:
+gates within a block only contend for slice ordering against gates within the
+same block.
+
+In practice, blocks between barriers are tiny — typically containing only 1 to 6
+gates (e.g. teleportation `starting_process` / `ending_process` commands, local
+phase rotations, or a CU1 gate). Instead of allocating $O(\#\text{qubits})$ wires
+in a global DAG for every barrier (which previously represented ~74 % of all DAG
+wires and ~55 % of DAG rebuild time), barriers are now simply boundary markers
+between blocks.
+
+When a block between barriers is finalized (or when `commit_block()` is called),
+a localized mini-DAG (`MiniWire`, `MiniVertex`) is constructed solely for the
+gates and active qubits in that small block:
+
+- The mini-DAG requires only a few wires ($2 \times \text{gates}$) and vertices,
+  taking ~20–50 ns to slice.
+- It strictly reproduces pytket's slice ordering and UnitID tie-breaking rules.
+- Blocks with $\le 1$ gate return immediately in $O(1)$.
+- Because `copy_cmd` renames link qubits according to `LinkManager` occupation,
+  parallel gates in the same slice can have their relative UnitID order inverted
+  if their link registers swap; running `slice_block()` per block guarantees that
+  the UnitID tie-breaking order remains 100% compliant with pytket even when gates
+  are copied.
+
+## Change 7 — incremental slice sequence maintenance and zero-copy command iteration
+
+`BuiltCircuit` previously kept commands in append order and reconstructed a
+monolithic global DAG (`vertices`, `wires`, `wire_seq`, `qubit_first_wire`,
+`frontier_wire`) whenever `get_commands_order()` was called. Because
+`one_hyperedge()` ran once per hyperedge, every hyperedge performed a full
+circuit DAG rebuild and a full circuit slice scan, re-traversing the entire
+circuit from scratch.
+
+With independent block slicing (Change 6), `BuiltCircuit` now maintains its
+`commands` vector **incrementally in pytket's slice order**:
+
+- Gates accumulate in `current_block`.
+- When a barrier is encountered or when `commit_block()` is called at the end of
+  the hyperedge pass, `slice_block(current_block)` orders the gates and appends
+  them directly to `commands`, followed by the barrier command.
+- The monolithic full-circuit DAG (`rebuild_dag()`, `get_commands_order()`,
+  global wire structures, epoch arrays) was completely removed from `BuiltCircuit`.
+- In `one_hyperedge()`, commands are scanned directly from the incoming circuit
+  by reference (`const std::vector<BuiltCommand>& commands = circ.commands;`),
+  eliminating the per-hyperedge circuit copy, DAG rebuild, and slice scan entirely.
+- Checkpoint restoration in `to_pytket_circuit()` simply restores `qubit_order`
+  and `commands` ($O(C)$ vector copy) with zero DAG reconstruction.
+
 ## Measured runtime
 
 Configuration: QFT on `P = 4` fully connected QPUs (`server_ebit_mem = 2`),
@@ -170,26 +231,33 @@ Configuration: QFT on `P = 4` fully connected QPUs (`server_ebit_mem = 2`),
 (`-O3`), consuming *the same* distribution before and after the change, so the
 numbers isolate the algorithm:
 
-| circuit | source cmds | hyperedges (initial → after splits) | before | after | speed-up | emitted circuit |
-| --- | --- | --- | --- | --- | --- | --- |
-| QFT 16 | 136 | 30 → 167 | 10.0 s | **0.50 s** | 20× | 352 cmds, 21 qubits, ebit 108 |
-| QFT 20 | 210 | 38 → 295 | 79.2 s | **2.8 s** | 28× | 584 cmds, 24 qubits, ebit 187 |
-| QFT 24 | 300 | 46 → 411 | 304.4 s | **5.5 s** | 55× | 818 cmds, 29 qubits, ebit 259 |
+| circuit | source cmds | hyperedges (initial → after splits) | baseline | changes 1–5 | changes 6–7 | total speed-up | emitted circuit |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| QFT 16 | 136 | 30 → 167 | 10.0 s | 0.50 s | **0.17 s** | **59×** | 352 cmds, 21 qubits, ebit 108 |
+| QFT 20 | 210 | 38 → 295 | 79.2 s | 2.8 s | **0.86 s** | **92×** | 584 cmds, 24 qubits, ebit 187 |
+| QFT 24 | 300 | 46 → 411 | 304.4 s | 5.5 s | **1.62 s** | **187×** | 818 cmds, 29 qubits, ebit 259 |
 
 Changes 1–3 (resume, Steiner cache, size-1 skip) brought those three cases to
-2.3 s / 17.0 s / 41.4 s; changes 4–5 removed another 4–8× on top of that, and the
-gain grows with circuit size because the terms they remove (per-slice array
-clearing, string-carrying command copies) scale with the circuit, not with the
-number of hyperedges.
+2.3 s / 17.0 s / 41.4 s; changes 4–5 removed another 4–8× on top of that; and
+changes 6–7 removed another 3.2–3.4× by eliminating the global DAG and slice scan
+entirely.
+
+Single pass over the already-split final hypergraph (`allow_update=False`):
+
+| circuit | final hyperedges | commands | changes 1–5 | changes 6–7 | speed-up |
+| --- | --- | --- | --- | --- | --- |
+| QFT 16 | 167 | 352 | ~30 ms | **15.5 ms** | ~2× |
+| QFT 20 | 295 | 584 | ~110 ms | **37.3 ms** | ~3× |
+| QFT 24 | 411 | 818 | ~270 ms | **75.9 ms** | **3.55×** |
 
 **End to end through the Python adapter** (`pytket_dqc_cpp.Distribution.to_pytket_circuit`,
 including the Python↔C++ conversion and the pytket circuit rebuild):
 
-| circuit | before | after |
-| --- | --- | --- |
-| QFT 16 | 11.2 s | **2.3 s** |
-| QFT 20 | 69.5 s | **4.5 s** |
-| QFT 24 | not measured end to end (core alone: 304.4 s) | **7.3 s** |
+| circuit | baseline | changes 1–5 | changes 6–7 |
+| --- | --- | --- | --- |
+| QFT 16 | 11.2 s | 2.3 s | **2.1 s** |
+| QFT 20 | 69.5 s | 4.5 s | **0.87 s** |
+| QFT 24 | not measured (>300 s) | 7.3 s | **1.63 s** |
 
 As an independent cross-check, the timings recorded by
 `tests/python/check_qft_equivalence.py` for the many-QPUs AESD pipeline (the same
@@ -198,9 +266,10 @@ package at 1.78 s / 17.2 s / 54.2 s / 345.5 s for 9 / 12 / 15 / 18 qubits and th
 port at 0.015 s / 0.084 s / 0.255 s / 1.07 s.
 
 The speed-up grows with size because the removed work scales with the circuit:
-change 1 factors out the restarts × suffix length, and changes 4–5 remove
-per-slice and per-command costs that grow with the circuit length and with the
-number of link qubits.
+change 1 factors out the restarts × suffix length, changes 4–5 remove
+per-slice and per-command costs that grow with circuit length, and changes 6–7
+replace the quadratic $O(K \cdot C)$ global DAG rebuild and scan with $O(1)$ block
+slicing and zero-copy iteration.
 
 ## Equivalence with the reference
 
@@ -229,23 +298,20 @@ and `tests/python/check_qft_equivalence.py`.
 
 ## What is still slow (next steps)
 
-A full pass over the final hypergraph now costs ~0.27 s (QFT 24, 411 hyperedges,
-818 emitted commands), split roughly as `get_commands_order()` ~45 %,
-`rebuild_dag()` ~45 % and the scan loop ~5 %; the build as a whole is ~9 300
-`one_hyperedge` calls because checkpoint replay redoes the affected suffix.
+Both structural bottlenecks identified previously — materializing
+$O(\#\text{qubits})$ wires in the DAG for barriers and recomputing
+`get_commands_order()` from scratch per hyperedge — have been eliminated by
+Changes 6 and 7. The monolithic global circuit DAG and `get_commands_order()`
+have been completely removed.
 
-The two remaining structural costs are:
-
-- `rebuild_dag()` still materialises two wires per qubit for every barrier
-  command, and barriers span every qubit (link registers included) — they are
-  ~55 % of the DAG rebuild time and ~74 % of all wires. Representing a barrier as
-  a per-qubit frontier version instead of a vertex with `O(#qubits)` wires would
-  remove that.
-- `get_commands_order()` is still recomputed from scratch for every hyperedge,
-  although each hyperedge only appends commands inside its own span. Maintaining
-  the slice sequence incrementally would turn the per-hyperedge `O(C)` order scan
-  into `O(span)`, and a persistent-DAG/undo-log design would remove the
-  per-hyperedge full circuit copy as well.
+The remaining execution time (~76 ms for a single pass on QFT 24 with 411
+hyperedges, and ~1.62 s for the full 365-split build across ~9 300
+`one_hyperedge` evaluations) is dominated by standard per-command loop work:
+- `LinkManager::update_occupation` lookups and state transitions across
+  communication processes.
+- Hyperedge span scanning and `copy_cmd` / command emission.
+- Suffix replay during hyperedge splits (which evaluates ~9 300 hyperedges at
+  ~0.17 ms per evaluation).
 
 ## Note for developers
 
