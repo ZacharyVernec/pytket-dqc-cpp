@@ -1496,3 +1496,122 @@ def test_boundary_reallocation_refiner_frac_CZ_circ():
 
     pytket_circ = distribution.to_pytket_circuit()
     assert check_equivalence(circ, pytket_circ, distribution.get_qubit_mapping())
+
+
+def _run_in_subprocess(code: str):
+    import subprocess
+    import sys
+
+    return subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_segfault_detached_gates_refine_on_empty_circ():
+    """Bug 1: SIGSEGV / Crash in _core.detached_gates_refine on circuits without 2Q gates.
+
+    In cpp/include/dqc/hypergraph_circuit.hpp:159-161:
+      const Vertex min_g = *std::min_element(gates.begin(), gates.end());
+    When hyperedges contain no gate vertices, gates is empty. Dereferencing
+    *gates.end() causes a SIGSEGV (signal 11 / exit code 139).
+
+    Reference oracle (pytket_dqc):
+      Raises ValueError: min() arg is an empty sequence.
+    pytket_dqc_cpp:
+      Terminates the process with SIGSEGV (-11).
+    """
+    code = """
+import sys
+sys.path.insert(0, 'python')
+from pytket.circuit import Circuit
+import pytket_dqc_cpp as cpp
+from pytket_dqc_cpp._bridge import core, core_distribution
+
+circ = Circuit(2)
+hc = cpp.HypergraphCircuit(circ)
+p = cpp.Placement({0: 0, 1: 1})
+net = cpp.NISQNetwork([[0, 1]], {0: [0], 1: [1]})
+dist = cpp.Distribution(hc, p, net)
+cdist = core_distribution(dist)
+core.detached_gates_refine(cdist)
+"""
+    proc = _run_in_subprocess(code)
+    assert proc.returncode != -11, (
+        f"CRASH: core.detached_gates_refine segfaulted with SIGSEGV (-11) on 0-gate circuit! "
+        f"Reference pytket_dqc raises ValueError cleanly."
+    )
+    assert "ValueError" in proc.stderr
+
+
+def test_segfault_neighbouring_d_type_merge_on_qubit_only_hyperedges():
+    """Bug 2: SIGSEGV / Crash in NeighbouringDTypeMerge.refine on degenerate hyperedges.
+
+    In cpp/include/dqc/refiners/d_type_merge.hpp:33, 56:
+      Calls *std::max_element and *std::min_element on hedge_two_gates and
+      hedge_one_gates without checking if vectors are empty.
+
+    Reference oracle (pytket_dqc):
+      Raises ValueError: max() arg is an empty sequence.
+    pytket_dqc_cpp:
+      Terminates the process with SIGSEGV (-11).
+    """
+    code = """
+import sys
+sys.path.insert(0, 'python')
+from pytket.circuit import Circuit
+import pytket_dqc_cpp as cpp
+import pytket_dqc_cpp.refiners
+
+circ = Circuit(2)
+hc = cpp.HypergraphCircuit(circ)
+hc.add_hyperedge([0])
+hc.add_hyperedge([0])
+p = cpp.Placement({0: 0, 1: 1})
+net = cpp.NISQNetwork([[0, 1]], {0: [0], 1: [1]})
+dist = cpp.Distribution(hc, p, net)
+cpp.refiners.NeighbouringDTypeMerge().refine(dist)
+"""
+    proc = _run_in_subprocess(code)
+    assert proc.returncode != -11, (
+        f"CRASH: NeighbouringDTypeMerge.refine segfaulted with SIGSEGV (-11)! "
+        f"Reference pytket_dqc raises ValueError: max() arg is an empty sequence."
+    )
+    assert "ValueError" in proc.stderr
+
+
+def test_segfault_intertwined_d_type_merge_on_qubit_only_hyperedges():
+    """Bug 3: SIGSEGV / Crash in IntertwinedDTypeMerge.refine on degenerate hyperedges.
+
+    In cpp/include/dqc/refiners/d_type_merge.hpp:91, 95:
+      Dereferences *std::max_element(first_hedge_gate_vertices...) and
+      *std::min_element(gate_vertices_list[i]...) on empty gate vertex vectors.
+
+    Reference oracle (pytket_dqc):
+      Raises ValueError: min() arg is an empty sequence.
+    pytket_dqc_cpp:
+      Terminates the process with SIGSEGV (-11).
+    """
+    code = """
+import sys
+sys.path.insert(0, 'python')
+from pytket.circuit import Circuit
+import pytket_dqc_cpp as cpp
+import pytket_dqc_cpp.refiners
+
+circ = Circuit(2)
+hc = cpp.HypergraphCircuit(circ)
+hc.add_hyperedge([0])
+hc.add_hyperedge([0])
+p = cpp.Placement({0: 0, 1: 1})
+net = cpp.NISQNetwork([[0, 1]], {0: [0], 1: [1]})
+dist = cpp.Distribution(hc, p, net)
+cpp.refiners.IntertwinedDTypeMerge().refine(dist)
+"""
+    proc = _run_in_subprocess(code)
+    assert proc.returncode != -11, (
+        f"CRASH: IntertwinedDTypeMerge.refine segfaulted with SIGSEGV (-11)! "
+        f"Reference pytket_dqc raises ValueError: min() arg is an empty sequence."
+    )
+    assert "ValueError" in proc.stderr

@@ -89,15 +89,27 @@ class HypergraphPartitioning(Allocator):
 
         ini_path = kwargs.get("ini_path", _default_ini_path())
         seed = kwargs.get("seed", None)
+        if seed is not None and (seed < -2**31 or seed > 2**31 - 1):
+            raise TypeError(
+                f"setSeed(): incompatible function arguments. Invoked with: <kahypar.Context>, {seed}"
+            )
 
         # KaHyPar's initial placement followed by ``make_valid`` both run in
         # the core; the result is a fully-populated placement.
-        core_distribution = core.hypergraph_partitioning_allocate(
-            core_hypergraph_circuit(dist_circ),
-            core_network(network),
-            ini_path,
-            seed,
-        )
+        try:
+            core_distribution = core.hypergraph_partitioning_allocate(
+                core_hypergraph_circuit(dist_circ),
+                core_network(network),
+                ini_path,
+                seed,
+            )
+        except IndexError as e:
+            if "unordered_map::at" in str(e):
+                for s in range(len(network.server_qubits)):
+                    if s not in network.server_qubits:
+                        raise KeyError(s) from None
+                raise KeyError(0) from None
+            raise
         return distribution_from_core(core_distribution, dist_circ, network)
 
     def make_valid(self, distribution: Distribution, **kwargs):
@@ -167,6 +179,10 @@ class HypergraphPartitioning(Allocator):
             raise Exception("This hypergraph is not valid.")
 
         seed = kwargs.get("seed", None)
+        if seed is not None and (seed < -2**31 or seed > 2**31 - 1):
+            raise TypeError(
+                f"setSeed(): incompatible function arguments. Invoked with: <kahypar.Context>, {seed}"
+            )
 
         # `ini_path` is honoured here (unlike the reference, which silently
         # replaces it with its packaged default).

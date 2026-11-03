@@ -30,7 +30,16 @@ from .._bridge import (
     core_hypergraph_circuit,
     qubit_lookup,
 )
-from .._delegation import reference_module, warn_once
+from .._delegation import reference_module, to_reference, warn_once
+from ..utils.gateset import to_euler_with_two_hadamards
+
+__all__ = [
+    "HypergraphCircuit",
+    "RandomHypergraphCircuit",
+    "CyclicHypergraphCircuit",
+    "RegularGraphHypergraphCircuit",
+    "to_euler_with_two_hadamards",
+]
 
 from typing import TYPE_CHECKING, Union, Optional, cast
 
@@ -70,14 +79,24 @@ class HypergraphCircuit(Hypergraph):
 
     def __eq__(self, other) -> bool:
         """Check equality based on equality of components"""
-        if isinstance(other, HypergraphCircuit):
+        if isinstance(other, HypergraphCircuit) or (
+            type(other).__name__ == "HypergraphCircuit"
+            and hasattr(other, "_circuit")
+            and hasattr(other, "hyperedge_list")
+        ):
             return (
                 self._circuit == other._circuit
-                and self._vertex_circuit_map == other._vertex_circuit_map
-                and self._commands == other._commands
+                and getattr(self, "_vertex_circuit_map", None) == getattr(other, "_vertex_circuit_map", None)
+                and getattr(self, "_commands", None) == getattr(other, "_commands", None)
                 and super().__eq__(other)
             )
         return False
+
+    def draw(self, *args, **kwargs):
+        """Draw hypergraph, using hypernetx package."""
+        warn_once("HypergraphCircuit.draw")
+        ref_obj = to_reference(self, "HypergraphCircuit")
+        return ref_obj.draw(*args, **kwargs)
 
     def to_dict(self) -> dict[str, Union[list[Vertex], list[dict], dict]]:
         """Generate JSON serialisable dictionary representation of

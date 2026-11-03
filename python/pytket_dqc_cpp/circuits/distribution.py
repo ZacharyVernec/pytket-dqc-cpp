@@ -31,9 +31,39 @@ from .._bridge import (
 from ..networks import NISQNetwork
 from ..placement import Placement
 from ..utils import steiner_tree
+from ..utils.circuit_analysis import (
+    ConstraintException,
+    ebit_cost,
+    all_cu1_local,
+    get_server_id,
+    is_link_qubit,
+)
+from ..utils.gateset import (
+    start_proc,
+    end_proc,
+    is_start_proc,
+    is_end_proc,
+    origin_of_start_proc,
+)
+from ..utils.verification import check_equivalence
 from pytket import Circuit, OpType, Qubit
 import networkx as nx  # type: ignore
 from numpy import isclose
+
+__all__ = [
+    "Distribution",
+    "ConstraintException",
+    "ebit_cost",
+    "all_cu1_local",
+    "get_server_id",
+    "is_link_qubit",
+    "start_proc",
+    "end_proc",
+    "is_start_proc",
+    "is_end_proc",
+    "origin_of_start_proc",
+    "check_equivalence",
+]
 
 
 class Distribution:
@@ -65,7 +95,12 @@ class Distribution:
 
     def __eq__(self, other) -> bool:
         """Check equality based on equality of components"""
-        if isinstance(other, Distribution):
+        if isinstance(other, Distribution) or (
+            type(other).__name__ == "Distribution"
+            and hasattr(other, "circuit")
+            and hasattr(other, "placement")
+            and hasattr(other, "network")
+        ):
             return (
                 self.circuit == other.circuit
                 and self.placement == other.placement

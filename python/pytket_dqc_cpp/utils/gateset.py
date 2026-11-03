@@ -149,6 +149,11 @@ def to_euler_with_two_hadamards(ops: list[Op]) -> list[Op]:
 
     NOTE: Global Phases are not preserved.
     """
+    if [op.type for op in ops].count(OpType.H) > 2:
+        raise AssertionError(
+            f"There should not be more than 2 Hadamards. {[op.type.name for op in ops]}"
+        )
+
     has_end_hadamard = len(ops) == 3 and (
         ops[0].type == OpType.H or ops[2].type == OpType.H
     )

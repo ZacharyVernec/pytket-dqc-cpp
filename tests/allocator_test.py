@@ -415,3 +415,71 @@ def test_CRz_circuits():
         {0: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 1: 1}
     )
     assert distribution.cost() == 1
+
+
+def test_annealing_allocate_exception_type_mismatch_on_single_server():
+    """Bug 10: Exception type mismatch in Annealing.allocate on 1-server network.
+
+    In cpp/include/dqc/rng.hpp:55:
+      std::invalid_argument("choice() on empty sequence") is mapped by pybind11
+      to ValueError.
+    Reference oracle (pytket_dqc.allocators.Annealing.allocate):
+      Python's random.choice([]) raises IndexError: Cannot choose from an empty sequence.
+    pytket_dqc_cpp:
+      Raises ValueError instead of IndexError.
+    """
+    import pytket_dqc_cpp as cpp
+
+    c = Circuit(1)
+    net_cpp = cpp.networks.NISQNetwork([[0, 0]], {0: [0]})
+
+    with pytest.raises(IndexError) as exc_info:
+        cpp.allocators.Annealing().allocate(c, net_cpp, iterations=1)
+
+    assert "Cannot choose from an empty sequence" in str(exc_info.value)
+
+
+def test_hypergraph_partitioning_key_error_on_non_contiguous_servers():
+    """Bug 11: Exception type mismatch in HypergraphPartitioning on non-contiguous server IDs.
+
+    In cpp/include/dqc/gain_manager.hpp:
+      occupancy_.at(server) throws std::out_of_range, mapped by pybind11 to
+      IndexError: unordered_map::at.
+    Reference oracle (pytket_dqc.allocators.HypergraphPartitioning.allocate):
+      Dict lookup occupancy[server] raises KeyError: 0.
+    pytket_dqc_cpp:
+      Raises IndexError instead of KeyError.
+    """
+    import pytket_dqc_cpp as cpp
+    from pytket.circuit import Op
+
+    cz = Op.create(OpType.CU1, 1.0)
+    circ = Circuit(2).add_gate(cz, [0, 1])
+    net_cpp = cpp.networks.NISQNetwork([[10, 20]], {10: [0], 20: [1]})
+
+    with pytest.raises(KeyError):
+        cpp.allocators.HypergraphPartitioning().allocate(circ, net_cpp)
+
+
+def test_hypergraph_partitioning_silent_overflow_on_large_seed():
+    """Bug 13: Silent integer truncation and missing validation on large seeds.
+
+    In cpp/include/dqc/hypergraph_partitioning.hpp:145:
+      kahypar_set_seed(context, static_cast<int>(*seed));
+      Silently casts uint64 to signed 32-bit int, overflowing seeds > 2^31 - 1.
+    Reference oracle (pytket_dqc.allocators.HypergraphPartitioning):
+      KaHyPar context raises TypeError: setSeed(): incompatible function arguments.
+    pytket_dqc_cpp:
+      Silently truncates to negative seed and passes without raising TypeError.
+    """
+    import pytket_dqc_cpp as cpp
+    from pytket.circuit import Op
+
+    cz = Op.create(OpType.CU1, 1.0)
+    circ = Circuit(2).add_gate(cz, [0, 1])
+    net_cpp = cpp.networks.NISQNetwork([[0, 1]], {0: [0], 1: [1]})
+    large_seed = 3000000000  # > 2**31 - 1
+
+    with pytest.raises(TypeError):
+        cpp.allocators.HypergraphPartitioning().allocate(circ, net_cpp, seed=large_seed)
+

@@ -107,15 +107,20 @@ class Annealing(Allocator):
         # post-loop state is installed again, matching the reference's use of
         # the module-level generator.  ``reseed=False`` keeps any draws Stage 1
         # already consumed.
-        core_dist = call_with_python_rng(
-            core.annealing_from_placement_with_state,
-            core_hypergraph_circuit(dist_circ),
-            core_placement(distribution.placement),
-            core_network(network),
-            int(iterations),
-            float(initial_temperature),
-            cache_limit,
-            normalize_seed(seed),
-            reseed=False,
-        )
+        try:
+            core_dist = call_with_python_rng(
+                core.annealing_from_placement_with_state,
+                core_hypergraph_circuit(dist_circ),
+                core_placement(distribution.placement),
+                core_network(network),
+                int(iterations),
+                float(initial_temperature),
+                cache_limit,
+                normalize_seed(seed),
+                reseed=False,
+            )
+        except ValueError as e:
+            if "choice" in str(e):
+                raise IndexError("Cannot choose from an empty sequence") from None
+            raise
         return distribution_from_core(core_dist, dist_circ, network)

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import networkx as nx  # type: ignore
 
+from .._delegation import reference_module, warn_once
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -52,9 +53,19 @@ class ServerNetwork:
 
     def __eq__(self, other):
         """Check equality based on equality of components"""
-        if isinstance(other, ServerNetwork):
+        if isinstance(other, ServerNetwork) or (
+            type(other).__name__ in ("ServerNetwork", "NISQNetwork")
+            and hasattr(other, "server_coupling")
+        ):
             return self.server_coupling == other.server_coupling
         return False
+
+    def draw_server_network(self, *args, **kwargs):
+        """Draw server network as graph of servers."""
+        warn_once("draw_server_network")
+        ref_cls = getattr(reference_module("networks"), "ServerNetwork")
+        ref_obj = ref_cls(self.server_coupling)
+        return ref_obj.draw_server_network(*args, **kwargs)
 
     def is_placement(self, placement: Placement) -> bool:
         """Checks that placement is valid for this network. In particular

@@ -283,3 +283,87 @@ def test_merge_with_embedding():
     )
     gain_mgr.merge_hyperedge(to_merge_hyperedge_list=to_merge_hyperedge_list)
     assert gain_mgr.distribution.cost() == 5
+
+
+def _run_in_subprocess(code: str):
+    import subprocess
+    import sys
+
+    return subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_segfault_gain_manager_merge_hyperedge_gain_empty():
+    """Bug 4: SIGSEGV / Crash in _core.GainManager.merge_hyperedge_gain([]).
+
+    In cpp/include/dqc/gain_manager.hpp:117:
+      to_merge_hyperedge_list[0].weight is accessed without verifying that
+      to_merge_hyperedge_list is non-empty.
+
+    Reference oracle (pytket_dqc.allocators.gain_manager.GainManager):
+      Raises IndexError: list index out of range.
+    pytket_dqc_cpp:
+      Terminates the process with SIGSEGV (-11).
+    """
+    code = """
+import sys
+sys.path.insert(0, 'python')
+from pytket.circuit import Circuit
+import pytket_dqc_cpp._core as core
+import pytket_dqc_cpp as cpp
+from pytket_dqc_cpp._bridge import core_distribution
+
+circ = Circuit(2)
+hc = cpp.HypergraphCircuit(circ)
+p = cpp.Placement({0: 0, 1: 1})
+net = cpp.NISQNetwork([[0, 1]], {0: [0], 1: [1]})
+dist = cpp.Distribution(hc, p, net)
+cdist = core_distribution(dist)
+gm = core.GainManager(cdist)
+gm.merge_hyperedge_gain([])
+"""
+    proc = _run_in_subprocess(code)
+    assert proc.returncode != -11, (
+        f"CRASH: GainManager.merge_hyperedge_gain([]) segfaulted with SIGSEGV (-11)! "
+        f"Reference pytket_dqc raises IndexError: list index out of range."
+    )
+    assert "IndexError" in proc.stderr
+
+
+def test_segfault_gain_manager_merge_hyperedge_empty():
+    """Bug 5: SIGSEGV / Crash in _core.GainManager.merge_hyperedge([]).
+
+    In cpp/include/dqc/hypergraph.hpp:228:
+      hyperedges_to_merge[0].weight is accessed without checking if empty.
+
+    Reference oracle (pytket_dqc.allocators.gain_manager.GainManager):
+      Raises IndexError: list index out of range.
+    pytket_dqc_cpp:
+      Terminates the process with SIGSEGV (-11).
+    """
+    code = """
+import sys
+sys.path.insert(0, 'python')
+from pytket.circuit import Circuit
+import pytket_dqc_cpp._core as core
+import pytket_dqc_cpp as cpp
+from pytket_dqc_cpp._bridge import core_distribution
+
+circ = Circuit(2)
+hc = cpp.HypergraphCircuit(circ)
+p = cpp.Placement({0: 0, 1: 1})
+net = cpp.NISQNetwork([[0, 1]], {0: [0], 1: [1]})
+dist = cpp.Distribution(hc, p, net)
+cdist = core_distribution(dist)
+gm = core.GainManager(cdist)
+gm.merge_hyperedge([])
+"""
+    proc = _run_in_subprocess(code)
+    assert proc.returncode != -11, (
+        f"CRASH: GainManager.merge_hyperedge([]) segfaulted with SIGSEGV (-11)! "
+        f"Reference pytket_dqc raises IndexError: list index out of range."
+    )
+    assert "IndexError" in proc.stderr

@@ -280,6 +280,10 @@ call time, emitting **one `UserWarning` per feature per process**:
 | `CyclicHypergraphCircuit`               | upstream circuit generator                                               |
 | `RegularGraphHypergraphCircuit`         | needs `networkx.random_regular_graph`                                  |
 | `utils.check_equivalence` (`to_pyzx`) | PyZX equivalence checking                                                |
+| `HypergraphCircuit.draw`                | visualization (needs `matplotlib` / `hypernetx`)                        |
+| `NISQNetwork.draw_nisq_network`         | visualization (needs `matplotlib` / `networkx` drawing)                 |
+| `NISQNetwork.draw_server_network`       | visualization (needs `matplotlib` / `networkx` drawing)                 |
+| `ServerNetwork.draw_server_network`     | visualization (needs `matplotlib` / `networkx` drawing)                 |
 
 They are correct but slower than the core-backed paths.
 
@@ -293,7 +297,7 @@ They are correct but slower than the core-backed paths.
 | `PacMan` (packets, neighbouring/hopping/merged, conflict graph)                                                                                                           | C++ core (`_core.PacMan`)                                                                                                                                    |
 | `Random`, `Ordered`, `Brute`, `Annealing`, `HypergraphPartitioning`                                                                     | C++ core allocators                                                                                                                                            |
 | `EagerHTypeMerge`, `NeighbouringDTypeMerge`, `IntertwinedDTypeMerge`, `BoundaryReallocation`                                                                        | C++ core refiners                                                                                                                                              |
-| `DetachedGates`                                                                                                                                                           | upstream Python `fixed_vertices` + `BoundaryReallocation` (the core entry point segfaults on hyperedges with no gate vertices; see "Known approximations") |
+| `DetachedGates`                                                                                                                                                           | upstream Python `fixed_vertices` + `BoundaryReallocation` (the core entry point now raises `ValueError` on degenerate hyperedges matching reference)       |
 | `GainManager`, `VertexCover` / `get_min_covers`, `DQCPass`, placement/network/hypergraph data structures                                                           | pure Python (hot primitives go to the core)                                                                                                                    |
 
 `Annealing.allocate` runs the initial placement allocator in Python, then hands that
@@ -375,7 +379,10 @@ partition call (`detail::ScopedStdoutSilencer`).
 - `Hypergraph.vertex_neighbours` uses `std::set` (ascending) as a stand-in for CPython int-set iteration order. This is **not observable**: `vertex_neighbours` is only ever used for membership and in `get_boundary` (where iteration order does not affect the returned vertex list), never iterated in an order-sensitive way.
 - `PacMan.are_hoppable_packets` faithfully reproduces a reference bug: the "reverse the second 1q-op list and retry" fallback is dead code because the guard compares `op.params` (a list) to `0`, which is always `False`.
 - `PyRandom::seed` covers integer seeds `<= 2^64-1`; larger seeds (and arbitrary-int keys) are expressible via `seed_words`.
-- `DetachedGates` in the Python adapter delegates `fixed_vertices` calculation to Python and routes to `BoundaryReallocation`, because the core `detached_gates_refine` entry point segfaults on hyperedges with no gate vertices (such as degenerate hyperedges containing only qubit vertices).
+- `DetachedGates`: The compiled core entry point `detached_gates_refine` checks for hyperedges with zero gate vertices (such as degenerate hyperedges containing only qubit vertices) and raises `ValueError: min() arg is an empty sequence` matching upstream reference behavior.
 - `ConstraintException` parity: when hardware communication memory capacity or placement constraints are violated during `Distribution.to_pytket_circuit()`, the pybind11 layer directly translates `dqc::ConstraintException` into `pytket_dqc_cpp.utils.circuit_analysis.ConstraintException`, attaching `.server`, `.v_gate`, and the remediation hint advising `to_pytket_circuit(allow_update=True)`.
+- `Cross-library equality`: `Placement`, `Distribution`, `HypergraphCircuit`, `Hypergraph`, `NISQNetwork`, and `ServerNetwork` implement duck-typed structural equality, enabling seamless `cpp_obj == ref_obj` equality comparisons without module-level coupling to `pytket_dqc`.
+- `Re-exports parity`: `circuits.distribution` re-exports `ConstraintException`, analysis helpers (`ebit_cost`, `all_cu1_local`, `get_server_id`, `is_link_qubit`), gateset helpers (`start_proc`, `end_proc`, `is_start_proc`, `is_end_proc`, `origin_of_start_proc`), and `check_equivalence`. `circuits.hypergraph_circuit` re-exports `to_euler_with_two_hadamards`.
+
 
 

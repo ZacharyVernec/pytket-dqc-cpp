@@ -41,7 +41,9 @@ class Placement:
 
     def __eq__(self, other):
         """Check equality based on equality of components"""
-        if isinstance(other, Placement):
+        if isinstance(other, Placement) or (
+            type(other).__name__ == "Placement" and hasattr(other, "placement")
+        ):
             return self.placement == other.placement
         return False
 

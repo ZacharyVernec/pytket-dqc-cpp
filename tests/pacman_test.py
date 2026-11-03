@@ -664,3 +664,77 @@ def test_intertwining_embeddings_1():
         5: [(P9,)],
     }
     assert merged_packets_ref == pacman.merged_packets
+
+
+def test_pacman_are_neighbouring_packets_packet_index_lookup_failure():
+    """Bug 8: RuntimeError in PacMan.are_neighbouring_packets on valid Packet objects.
+
+    In python/pytket_dqc_cpp/packing/pacman.py:434 and cpp/python/bindings.cpp:484:
+      are_neighbouring_packets extracts packet_index and performs an internal table
+      lookup in C++ pm.packets_by_qubit(). When packets are constructed or manipulated
+      with valid attributes, C++ throws std::runtime_error("packet index not found").
+
+    Reference oracle (pytket_dqc.packing.PacMan.are_neighbouring_packets):
+      Directly evaluates packet properties and returns True.
+    pytket_dqc_cpp:
+      Throws RuntimeError("packet index not found").
+    """
+    import pytket_dqc as ref
+    import pytket_dqc.packing
+    import pytket_dqc_cpp as cpp
+    import pytket_dqc_cpp.packing
+
+    c = Circuit(2)
+    c.add_gate(OpType.CU1, 0.5, [0, 1])
+
+    ref_pm = ref.packing.PacMan(ref.HypergraphCircuit(c), ref.Placement({0: 0, 1: 1, 2: 0}))
+    h0_ref = ref_pm.hypergraph_circuit.hyperedge_list[0]
+    p1_ref = ref.packing.Packet(999, 0, 1, [2], h0_ref)
+    p2_ref = ref.packing.Packet(1000, 0, 1, [2], h0_ref)
+    expected = ref_pm.are_neighbouring_packets(p1_ref, p2_ref)
+    assert expected is True
+
+    cpp_pm = cpp.packing.PacMan(cpp.HypergraphCircuit(c), cpp.Placement({0: 0, 1: 1, 2: 0}))
+    h0_cpp = cpp_pm.hypergraph_circuit.hyperedge_list[0]
+    p1_cpp = cpp.packing.Packet(999, 0, 1, [2], h0_cpp)
+    p2_cpp = cpp.packing.Packet(1000, 0, 1, [2], h0_cpp)
+
+    result = cpp_pm.are_neighbouring_packets(p1_cpp, p2_cpp)
+    assert result == expected
+
+
+def test_pacman_are_hoppable_packets_packet_index_lookup_failure():
+    """Bug 9: RuntimeError in PacMan.are_hoppable_packets on valid Packet objects.
+
+    In python/pytket_dqc_cpp/packing/pacman.py:457 and cpp/python/bindings.cpp:495:
+      are_hoppable_packets only forwards packet_index to C++, which throws
+      std::runtime_error("packet index not found").
+
+    Reference oracle (pytket_dqc.packing.PacMan.are_hoppable_packets):
+      Evaluates packet hop conditions and returns False.
+    pytket_dqc_cpp:
+      Throws RuntimeError("packet index not found").
+    """
+    import pytket_dqc as ref
+    import pytket_dqc.packing
+    import pytket_dqc_cpp as cpp
+    import pytket_dqc_cpp.packing
+
+    c = Circuit(2)
+    c.add_gate(OpType.CU1, 0.5, [0, 1])
+
+    ref_pm = ref.packing.PacMan(ref.HypergraphCircuit(c), ref.Placement({0: 0, 1: 1, 2: 0}))
+    h0_ref = ref_pm.hypergraph_circuit.hyperedge_list[0]
+    p1_ref = ref.packing.Packet(999, 0, 1, [2], h0_ref)
+    p2_ref = ref.packing.Packet(1000, 0, 1, [2], h0_ref)
+    expected = ref_pm.are_hoppable_packets(p1_ref, p2_ref)
+    assert expected is False
+
+    cpp_pm = cpp.packing.PacMan(cpp.HypergraphCircuit(c), cpp.Placement({0: 0, 1: 1, 2: 0}))
+    h0_cpp = cpp_pm.hypergraph_circuit.hyperedge_list[0]
+    p1_cpp = cpp.packing.Packet(999, 0, 1, [2], h0_cpp)
+    p2_cpp = cpp.packing.Packet(1000, 0, 1, [2], h0_cpp)
+
+    result = cpp_pm.are_hoppable_packets(p1_cpp, p2_cpp)
+    assert result == expected
+

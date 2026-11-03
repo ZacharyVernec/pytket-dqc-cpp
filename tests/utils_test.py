@@ -348,3 +348,94 @@ def test_to_euler_with_two_hadamards():
             np.identity(2),
             identity_up_to_global_phase / identity_up_to_global_phase[0][0],
         )
+
+
+def _run_in_subprocess(code: str):
+    import subprocess
+    import sys
+
+    return subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_segfault_to_euler_with_two_hadamards_h_at_start():
+    """Bug 6: SIGSEGV / Crash in _core.to_euler_with_two_hadamards on [H, Rz, Rz].
+
+    In cpp/include/dqc/gateset.hpp:61:
+      When ops.size() == 3 and hadamard_count == 1 with H at the start (ops[0]),
+      the code reads ops[0].params[0]. Because H has empty params, this accesses
+      out-of-bounds vector memory and crashes with SIGSEGV.
+
+    Reference oracle (pytket_dqc.utils.gateset.to_euler_with_two_hadamards):
+      Raises IndexError: list index out of range.
+    pytket_dqc_cpp:
+      Terminates the process with SIGSEGV (-11).
+    """
+    code = """
+import sys
+sys.path.insert(0, 'python')
+from pytket.circuit import OpType
+import pytket_dqc_cpp._core as core
+
+ops = [(OpType.H, []), (OpType.Rz, [0.3]), (OpType.Rz, [0.4])]
+core.to_euler_with_two_hadamards(ops)
+"""
+    proc = _run_in_subprocess(code)
+    assert proc.returncode != -11, (
+        f"CRASH: core.to_euler_with_two_hadamards segfaulted with SIGSEGV (-11) on [H, Rz, Rz]! "
+        f"Reference pytket_dqc raises IndexError: list index out of range."
+    )
+    assert "IndexError" in proc.stderr
+
+
+def test_segfault_to_euler_with_two_hadamards_h_at_end():
+    """Bug 7: SIGSEGV / Crash in _core.to_euler_with_two_hadamards on [Rz, Rz, H].
+
+    In cpp/include/dqc/gateset.hpp:62:
+      When ops.size() == 3 and hadamard_count == 1 with H at the end (ops[2]),
+      the code reads ops[2].params[0]. Because H has empty params, this accesses
+      out-of-bounds vector memory and crashes with SIGSEGV.
+
+    Reference oracle (pytket_dqc.utils.gateset.to_euler_with_two_hadamards):
+      Raises IndexError: list index out of range.
+    pytket_dqc_cpp:
+      Terminates the process with SIGSEGV (-11).
+    """
+    code = """
+import sys
+sys.path.insert(0, 'python')
+from pytket.circuit import OpType
+import pytket_dqc_cpp._core as core
+
+ops = [(OpType.Rz, [0.3]), (OpType.Rz, [0.4]), (OpType.H, [])]
+core.to_euler_with_two_hadamards(ops)
+"""
+    proc = _run_in_subprocess(code)
+    assert proc.returncode != -11, (
+        f"CRASH: core.to_euler_with_two_hadamards segfaulted with SIGSEGV (-11) on [Rz, Rz, H]! "
+        f"Reference pytket_dqc raises IndexError: list index out of range."
+    )
+    assert "IndexError" in proc.stderr
+
+
+def test_to_euler_with_two_hadamards_assertion_error_parity():
+    """Bug 12: Exception type mismatch in to_euler_with_two_hadamards on >2 Hadamards.
+
+    In cpp/include/dqc/gateset.hpp:31:
+      Throws std::runtime_error("There should not be more than 2 Hadamards."),
+      translating to RuntimeError.
+    Reference oracle (pytket_dqc.utils.gateset.to_euler_with_two_hadamards):
+      Uses assert hadamard_count <= 2, raising AssertionError.
+    pytket_dqc_cpp:
+      Raises RuntimeError instead of AssertionError.
+    """
+    import pytket_dqc_cpp as cpp
+
+    ops = [Op.create(OpType.H), Op.create(OpType.H), Op.create(OpType.H)]
+
+    with pytest.raises(AssertionError):
+        cpp.utils.gateset.to_euler_with_two_hadamards(ops)
+

@@ -12,7 +12,7 @@ They are the interface acceptance gate for the `pytket_dqc_cpp` adapter.
 
 - Every `pytket_dqc` import root is rewritten to `pytket_dqc_cpp` (the test
   bodies are otherwise unchanged, including expected exception messages).
-- `network_test.py::test_nisq_draw` is removed: drawing is out of scope.
+- `network_test.py::test_nisq_draw` is replaced by tests for delegated drawing (`test_missing_draw_methods_in_nisq_network`, `test_missing_draw_server_network_in_server_network`).
 - `allocator_test.py::test_kahypar_install` loads the INI file from
   `pytket_dqc_cpp/allocators/km1_kKaHyPar_sea20.ini` via `pathlib` instead of
   `importlib_resources.files("pytket_dqc")`.
@@ -24,10 +24,14 @@ They are the interface acceptance gate for the `pytket_dqc_cpp` adapter.
 - `rng_semantics_test.py` and `error_parity_test.py` are adapter-specific test suites
   covering RNG reproducibility semantics and strict `ConstraintException` API parity
   against the upstream reference.
+- Regression tests for Categories 1-5 bugs/discrepancies are integrated directly
+  into their respective test modules (`refiner_test.py`, `gain_manager_test.py`,
+  `utils_test.py`, `pacman_test.py`, `allocator_test.py`, `placement_test.py`,
+  `distribution_test.py`, `circuits_test.py`, `network_test.py`).
 
 ## Upstream Skips in Vendored Suite
 
-When running `pytest tests -m "not high_compute"` (which executes 159 tests: 152 passed, 7 skipped), 7 tests are skipped upstream.
+When running `pytest tests -m "not high_compute"` (which executes 183 tests: 176 passed, 7 skipped), 7 tests are skipped upstream.
 These are identical to the skips present in the upstream `pytket-dqc@1ac175e` repository:
 
 1. `tests/allocator_test.py:152` (`test_refinement_makes_valid`): "Circuit contains CX gates that are not supported."

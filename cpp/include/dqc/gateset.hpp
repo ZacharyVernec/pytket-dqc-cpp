@@ -58,6 +58,9 @@ inline std::vector<Op> to_euler_with_two_hadamards(const std::vector<Op>& ops) {
       new_ops = {new_phase_op, hadamard, s_op, hadamard, s_op};
       if (phase_op_index) std::reverse(new_ops.begin(), new_ops.end());
     } else {  // [Op, H, Op]
+      if (hadamard_indices[0] == 0 || hadamard_indices[0] == 2) {
+        throw std::out_of_range("list index out of range");
+      }
       const double first_phase = ops[0].params[0];
       const double second_phase = ops[2].params[0];
       new_ops = {Op::create(kOpRz, {first_phase + 0.5}), hadamard, s_op,

@@ -96,7 +96,11 @@ class Hypergraph:
 
     def __eq__(self, other) -> bool:
         """Check equality based on equality of components"""
-        if isinstance(other, Hypergraph):
+        if isinstance(other, Hypergraph) or (
+            type(other).__name__ in ("Hypergraph", "HypergraphCircuit")
+            and hasattr(other, "vertex_list")
+            and hasattr(other, "hyperedge_list")
+        ):
             return (
                 self.vertex_list == other.vertex_list
                 and self.hyperedge_list == other.hyperedge_list

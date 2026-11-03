@@ -198,3 +198,34 @@ def test_server_network_is_placement():
     assert not large_network.is_placement(placement_five)
     assert small_network.is_placement(placement_one)
     assert not small_network.is_placement(placement_two)
+
+
+def test_missing_draw_methods_in_nisq_network():
+    """Bug 22: draw_nisq_network and draw_server_network are missing on NISQNetwork.
+
+    Reference pytket_dqc.NISQNetwork provides visualization methods:
+      draw_nisq_network, draw_server_network
+    In pytket_dqc_cpp.NISQNetwork, both methods are missing.
+    """
+    import pytket_dqc_cpp as cpp
+
+    assert hasattr(cpp.NISQNetwork, "draw_nisq_network"), (
+        "NISQNetwork.draw_nisq_network is missing in pytket_dqc_cpp!"
+    )
+    assert hasattr(cpp.NISQNetwork, "draw_server_network"), (
+        "NISQNetwork.draw_server_network is missing in pytket_dqc_cpp!"
+    )
+
+
+def test_missing_draw_server_network_in_server_network():
+    """Bug 23: draw_server_network is missing on ServerNetwork.
+
+    Reference pytket_dqc.networks.ServerNetwork provides:
+      draw_server_network
+    In pytket_dqc_cpp.networks.ServerNetwork, this method is missing.
+    """
+    import pytket_dqc_cpp as cpp
+
+    assert hasattr(cpp.networks.ServerNetwork, "draw_server_network"), (
+        "ServerNetwork.draw_server_network is missing in pytket_dqc_cpp!"
+    )

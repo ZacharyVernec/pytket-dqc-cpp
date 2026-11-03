@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 from pytket_dqc_cpp.networks.server_network import ServerNetwork
+from .._delegation import to_reference, warn_once
 from itertools import combinations
 import networkx as nx  # type:ignore
 from pytket.placement import NoiseAwarePlacement
@@ -108,13 +109,30 @@ class NISQNetwork(ServerNetwork):
 
     def __eq__(self, other):
         """Check equality based on equality of components"""
-        if isinstance(other, NISQNetwork):
+        if isinstance(other, NISQNetwork) or (
+            type(other).__name__ == "NISQNetwork"
+            and hasattr(other, "server_qubits")
+            and hasattr(other, "server_ebit_mem")
+            and hasattr(other, "server_coupling")
+        ):
             return (
                 self.server_qubits == other.server_qubits
                 and self.server_ebit_mem == other.server_ebit_mem
                 and super().__eq__(other)
             )
         return False
+
+    def draw_nisq_network(self, *args, **kwargs):
+        """Draw internal server architectures and couplings."""
+        warn_once("draw_nisq_network")
+        ref_obj = to_reference(self, "NISQNetwork")
+        return ref_obj.draw_nisq_network(*args, **kwargs)
+
+    def draw_server_network(self, *args, **kwargs):
+        """Draw network as graph of servers."""
+        warn_once("draw_server_network")
+        ref_obj = to_reference(self, "NISQNetwork")
+        return ref_obj.draw_server_network(*args, **kwargs)
 
     def to_dict(
         self,

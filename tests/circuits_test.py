@@ -2029,3 +2029,45 @@ def test_embedding_detached():
 
     warnings.resetwarnings()
     assert caught_warning
+
+
+def test_hypergraph_circuit_cross_library_equality():
+    """Bug 16: HypergraphCircuit.__eq__ fails across pytket_dqc and pytket_dqc_cpp."""
+    import pytket_dqc as ref
+    import pytket_dqc_cpp as cpp
+
+    c = Circuit(2)
+    c.add_gate(OpType.CU1, 1.0, [0, 1])
+
+    hc_ref = ref.HypergraphCircuit(c)
+    hc_cpp = cpp.HypergraphCircuit(c)
+
+    assert hc_cpp == hc_ref, "HypergraphCircuit equality failed against equivalent reference HypergraphCircuit!"
+
+
+def test_missing_to_euler_with_two_hadamards_in_circuits_hypergraph():
+    """Bug 21: to_euler_with_two_hadamards is missing from circuits.hypergraph_circuit.
+
+    Upstream pytket_dqc.circuits.hypergraph_circuit exports:
+      from ..utils.gateset import to_euler_with_two_hadamards
+    In pytket_dqc_cpp.circuits.hypergraph_circuit, it is missing.
+    """
+    import pytket_dqc_cpp as cpp
+
+    assert hasattr(cpp.circuits.hypergraph_circuit, "to_euler_with_two_hadamards"), (
+        "to_euler_with_two_hadamards is missing from pytket_dqc_cpp.circuits.hypergraph_circuit!"
+    )
+
+
+def test_missing_draw_method_in_hypergraph_circuit():
+    """Bug 24: draw is missing on HypergraphCircuit.
+
+    Reference pytket_dqc.HypergraphCircuit provides:
+      draw
+    In pytket_dqc_cpp.HypergraphCircuit, this method is missing.
+    """
+    import pytket_dqc_cpp as cpp
+
+    assert hasattr(cpp.HypergraphCircuit, "draw"), (
+        "HypergraphCircuit.draw is missing in pytket_dqc_cpp!"
+    )

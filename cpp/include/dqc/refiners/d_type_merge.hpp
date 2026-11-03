@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -28,6 +29,13 @@ inline bool neighbouring_d_type_merge_refine(Distribution& distribution) {
           circuit.get_gate_vertices(hedge_one);
       const std::vector<Vertex> hedge_two_gates =
           circuit.get_gate_vertices(hedge_two);
+
+      if (hedge_two_gates.empty()) {
+        throw std::invalid_argument("max() arg is an empty sequence");
+      }
+      if (hedge_one_gates.empty()) {
+        throw std::invalid_argument("min() arg is an empty sequence");
+      }
 
       const Vertex min_two =
           *std::min_element(hedge_two_gates.begin(), hedge_two_gates.end());
@@ -87,10 +95,16 @@ inline bool intertwined_d_type_merge_refine(Distribution& distribution) {
       gate_vertices_list.erase(gate_vertices_list.begin());
 
       std::vector<std::pair<Hyperedge, std::vector<Vertex>>> intertwined;
+      if (first_hedge_gate_vertices.empty()) {
+        throw std::invalid_argument("min() arg is an empty sequence");
+      }
       const Vertex max_first =
           *std::max_element(first_hedge_gate_vertices.begin(),
                             first_hedge_gate_vertices.end());
       for (std::size_t i = 0; i < hedge_list.size(); ++i) {
+        if (gate_vertices_list[i].empty()) {
+          throw std::invalid_argument("min() arg is an empty sequence");
+        }
         const Vertex min_g =
             *std::min_element(gate_vertices_list[i].begin(),
                               gate_vertices_list[i].end());

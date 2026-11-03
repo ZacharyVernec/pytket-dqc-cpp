@@ -286,3 +286,94 @@ def test_detached_gate_list():
 
     assert dist.detached_gate_count() == 1
     assert dist.non_local_gate_count() == 2
+
+
+def test_distribution_cross_library_equality():
+    """Bug 15: Distribution.__eq__ fails across pytket_dqc and pytket_dqc_cpp.
+
+    Distribution.__eq__ checks isinstance(other, Distribution) against its local module,
+    returning False for an equivalent Distribution object from the sibling library.
+    """
+    import pytket_dqc as ref
+    import pytket_dqc_cpp as cpp
+
+    c = Circuit(2)
+    c.add_gate(OpType.CU1, 1.0, [0, 1])
+    mapping = {0: 0, 1: 1, 2: 0}
+
+    d_ref = ref.Distribution(
+        ref.HypergraphCircuit(c),
+        ref.Placement(mapping),
+        ref.NISQNetwork([[0, 1]], {0: [0], 1: [1]}),
+    )
+    d_cpp = cpp.Distribution(
+        cpp.HypergraphCircuit(c),
+        cpp.Placement(mapping),
+        cpp.NISQNetwork([[0, 1]], {0: [0], 1: [1]}),
+    )
+
+    assert d_cpp == d_ref, "Distribution equality failed against equivalent reference Distribution!"
+
+
+def test_missing_constraint_exception_in_circuits_distribution():
+    """Bug 17: ConstraintException is not exported from circuits.distribution.
+
+    Upstream pytket_dqc/circuits/distribution.py imports and re-exports:
+      from ..utils.circuit_analysis import ConstraintException
+    In pytket_dqc_cpp.circuits.distribution, this export was omitted.
+    """
+    import pytket_dqc_cpp as cpp
+
+    assert hasattr(cpp.circuits.distribution, "ConstraintException"), (
+        "ConstraintException is missing from pytket_dqc_cpp.circuits.distribution!"
+    )
+
+
+def test_missing_analysis_helpers_in_circuits_distribution():
+    """Bug 18: Distribution analysis helpers are not exported from circuits.distribution.
+
+    Upstream pytket_dqc.circuits.distribution exports:
+      ebit_cost, all_cu1_local, get_server_id, is_link_qubit.
+    In pytket_dqc_cpp.circuits.distribution, all four are missing.
+    """
+    import pytket_dqc_cpp as cpp
+
+    for helper_name in ["ebit_cost", "all_cu1_local", "get_server_id", "is_link_qubit"]:
+        assert hasattr(cpp.circuits.distribution, helper_name), (
+            f"Helper function '{helper_name}' is missing from pytket_dqc_cpp.circuits.distribution!"
+        )
+
+
+def test_missing_gateset_helpers_in_circuits_distribution():
+    """Bug 19: Gateset helpers are not exported from circuits.distribution.
+
+    Upstream pytket_dqc.circuits.distribution exports:
+      start_proc, end_proc, is_start_proc, is_end_proc, origin_of_start_proc.
+    In pytket_dqc_cpp.circuits.distribution, all five are missing.
+    """
+    import pytket_dqc_cpp as cpp
+
+    for helper_name in [
+        "start_proc",
+        "end_proc",
+        "is_start_proc",
+        "is_end_proc",
+        "origin_of_start_proc",
+    ]:
+        assert hasattr(cpp.circuits.distribution, helper_name), (
+            f"Gateset helper '{helper_name}' is missing from pytket_dqc_cpp.circuits.distribution!"
+        )
+
+
+def test_missing_check_equivalence_in_circuits_distribution():
+    """Bug 20: check_equivalence is not exported from circuits.distribution.
+
+    Upstream pytket_dqc.circuits.distribution exports:
+      from ..utils.verification import check_equivalence
+    In pytket_dqc_cpp.circuits.distribution, it is missing.
+    """
+    import pytket_dqc_cpp as cpp
+
+    assert hasattr(cpp.circuits.distribution, "check_equivalence"), (
+        "check_equivalence is missing from pytket_dqc_cpp.circuits.distribution!"
+    )

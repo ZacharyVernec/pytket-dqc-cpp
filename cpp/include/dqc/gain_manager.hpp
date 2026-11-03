@@ -100,6 +100,9 @@ class GainManager {
 
   int merge_hyperedge_gain(
       const std::vector<Hyperedge>& to_merge_hyperedge_list) {
+    if (to_merge_hyperedge_list.empty()) {
+      throw std::out_of_range("list index out of range");
+    }
     std::set<Hyperedge> unique(to_merge_hyperedge_list.begin(),
                                to_merge_hyperedge_list.end());
     if (unique.size() != to_merge_hyperedge_list.size()) {

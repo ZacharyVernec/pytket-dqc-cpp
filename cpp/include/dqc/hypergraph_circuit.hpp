@@ -157,6 +157,9 @@ class HypergraphCircuit : public Hypergraph {
         get_hyperedge_subcircuit(hyperedge);
     std::vector<Vertex> gate_vertices_in_subcircuit;
     const std::vector<Vertex> gates = get_gate_vertices(hyperedge);
+    if (gates.empty()) {
+      throw std::invalid_argument("min() arg is an empty sequence");
+    }
     const Vertex min_g = *std::min_element(gates.begin(), gates.end());
     const Vertex max_g = *std::max_element(gates.begin(), gates.end());
     const std::string& q = qubit_of_vertex(get_qubit_vertex(hyperedge));

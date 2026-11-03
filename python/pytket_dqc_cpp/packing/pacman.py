@@ -430,11 +430,47 @@ class PacMan:
         ):
             return False
 
-        return bool(
-            self._core_pacman.are_neighbouring_packets(
-                first_packet.packet_index, second_packet.packet_index
+        try:
+            return bool(
+                self._core_pacman.are_neighbouring_packets(
+                    first_packet.packet_index, second_packet.packet_index
+                )
             )
-        )
+        except RuntimeError:
+            intermediate_commands = self.get_intermediate_commands(
+                first_packet, second_packet
+            )
+            # Since DQCPass() removes X gates,
+            # need to see if there is a sequence
+            # HZH (= X) in the intermediate commands
+            # The below switches activate accordingly when
+            # - An initial H is found (searching_for_Z is True)
+            # - Next command is a Z (searching_for_Z False, searching_for_H True)
+            # - Next command is a H (searching_for_H is False)
+            # Then we can continue as usual
+            searching_for_Z = False
+            searching_for_H = False
+            for command in intermediate_commands:
+                if searching_for_Z:
+                    if command.op.type == OpType.Rz and abs(command.op.params[0]) == 1:
+                        logger.debug("Found Z, looking for second H")
+                        searching_for_Z = False
+                        searching_for_H = True
+                    else:
+                        return False
+                elif searching_for_H:
+                    if command.op.type == OpType.H:
+                        logger.debug("Found second H, got an X overall")
+                        searching_for_H = False
+                    else:
+                        return False
+                elif command.op.type == OpType.H:
+                    logger.debug("Found first H, now looking for Z")
+                    searching_for_Z = True
+                elif not is_distributable(command.op):
+                    return False
+
+            return not (searching_for_H or searching_for_Z)
 
     def are_hoppable_packets(self, first_packet: Packet, second_packet: Packet) -> bool:
         """Given two packets, determine if they can
@@ -453,11 +489,132 @@ class PacMan:
             first_packet.connected_server_index == second_packet.connected_server_index
         ), "Cannot pack packets connected to different servers"
 
-        return bool(
-            self._core_pacman.are_hoppable_packets(
-                first_packet.packet_index, second_packet.packet_index
+        try:
+            return bool(
+                self._core_pacman.are_hoppable_packets(
+                    first_packet.packet_index, second_packet.packet_index
+                )
             )
-        )
+        except RuntimeError:
+            intermediate_commands = self.get_intermediate_commands(
+                first_packet, second_packet
+            )
+
+            # Find the indices of the Hadamards in
+            # intermediate_commands.
+            # If there are any local CU1s before/after the first/last
+            # Hadamards they can be ignored.
+            h_indices = [
+                i
+                for i, command in enumerate(intermediate_commands)
+                if command.op.type == OpType.H
+            ]
+            if len(h_indices) < 2:
+                return False
+
+            # Find and check that all the CU1 gates are embeddable
+            # Store their indices in ``intermediate_commands`` so that
+            # it can be sliced later into lists of 1 qubit gates between
+            # the CU1 gates.
+            cu1_indices = []
+            for i, command in enumerate(intermediate_commands):
+                if command.op.type == OpType.CU1:
+                    # Ignore CU1s before or after the
+                    # first or last H - these don't affect embedding
+                    # as they can commute past CU1s and single-qubit
+                    # embeddable gates.
+                    if i < h_indices[0] or i > h_indices[-1]:
+                        pass
+                    elif not self.hypergraph_circuit.is_h_embeddable_CU1(
+                        command,
+                        set(
+                            [
+                                self.placement.placement[first_packet.qubit_vertex],
+                                first_packet.connected_server_index,
+                            ]
+                        ),
+                        self.placement,
+                    ):
+                        return False
+                    else:
+                        cu1_indices.append(i)
+
+            # If there are no CU1s between Hadamards
+            # then there is nothing to embed.
+            if not cu1_indices:
+                return False
+
+            # Add the ops at the start of the embedding.
+            # Ignore gates before the first H - these don't
+            # affect embedding as they can commute past CU1s
+            # and single-qubit embeddable gates.
+            ops_1q_list: list[list[Op]] = [
+                [
+                    command.op
+                    for command in intermediate_commands[
+                        h_indices[0] : cu1_indices[0]
+                    ]
+                ]
+            ]
+
+            # Convert the intermediate commands between CU1s
+            # to ensure they have 2 Hadamards
+            # barring the initial set of commands and the final
+            # set of commands
+            prev_cu1_index = cu1_indices[0]
+            for cu1_index in cu1_indices[1:]:
+                commands = intermediate_commands[prev_cu1_index + 1 : cu1_index]
+                ops = [command.op for command in commands]
+                ops_1q_list.append(to_euler_with_two_hadamards(ops))
+                prev_cu1_index = cu1_index
+
+            # Add the ops at the end of the embedding
+            # Ignore gates after the last H - these don't
+            # affect embedding as they can commute past CU1s
+            # and single-qubit embeddable gates.
+            ops_1q_list.append(
+                [
+                    command.op
+                    for command in intermediate_commands[
+                        cu1_indices[-1] + 1 : h_indices[-1] + 1
+                    ]
+                ]
+            )
+
+            n_hadamards_start = len([op for op in ops_1q_list[0] if op.type == OpType.H])
+            if n_hadamards_start != 1:
+                return False
+
+            n_hadamards_end = len([op for op in ops_1q_list[-1] if op.type == OpType.H])
+            if n_hadamards_end != 1:
+                return False
+
+            # In the case that two Hadamards were inserted at the end of
+            # just a single Rz gate, we need to check if the embedding
+            # condition is met if we insert the two Hadamards at the start
+            is_reversed = False
+            for first_ops_1q, second_ops_1q in zip(ops_1q_list[0:-1], ops_1q_list[1:]):
+                if is_reversed:
+                    first_ops_1q_to_try = list(reversed(first_ops_1q))
+                else:
+                    first_ops_1q_to_try = first_ops_1q
+                is_reversed = False
+                if not (self.are_1q_op_phases_npi(first_ops_1q_to_try, second_ops_1q)):
+                    if (
+                        len(second_ops_1q) == 5
+                        and second_ops_1q[2].params == 0
+                        and second_ops_1q[4].params == 0
+                    ):
+                        if self.are_1q_op_phases_npi(
+                            first_ops_1q_to_try, list(reversed(second_ops_1q))
+                        ):
+                            is_reversed = True
+                        else:
+                            return False
+                    else:
+                        return False
+
+            return True
 
     def get_conflict_hoppings(
         self, hopping_packet: HoppingPacket

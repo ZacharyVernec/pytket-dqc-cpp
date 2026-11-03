@@ -43,3 +43,19 @@ def test_placement_valid():
     assert not placement_seven.is_valid(dist_small_circ, small_network)
     assert placement_eight.is_valid(dist_small_circ, small_network)
     assert not placement_nine.is_valid(dist_small_circ, small_network)
+
+
+def test_placement_cross_library_equality():
+    """Bug 14: Placement.__eq__ fails across pytket_dqc and pytket_dqc_cpp.
+
+    Placement.__eq__ checks isinstance(other, Placement) against its local module,
+    returning False for an equivalent Placement object from the sibling library.
+    """
+    import pytket_dqc as ref
+    import pytket_dqc_cpp as cpp
+
+    mapping = {0: 0, 1: 1, 2: 0}
+    p_ref = ref.Placement(mapping)
+    p_cpp = cpp.Placement(mapping)
+
+    assert p_cpp == p_ref, "Placement equality failed against equivalent reference Placement!"

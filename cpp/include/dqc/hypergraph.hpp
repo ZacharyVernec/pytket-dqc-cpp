@@ -217,6 +217,9 @@ class Hypergraph {
   }
 
   Hyperedge merge_hyperedge(const std::vector<Hyperedge>& to_merge) {
+    if (to_merge.empty()) {
+      throw std::out_of_range("list index out of range");
+    }
     for (const Hyperedge& e : to_merge) {
       if (!contains_hyperedge(e)) {
         throw std::runtime_error(
