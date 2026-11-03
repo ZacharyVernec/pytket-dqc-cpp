@@ -15,9 +15,10 @@
 
 namespace dqc {
 
-// Mirrors `Distribution.hyperedge_cost(hyperedge, server_tree=..., \
-// requires_h_embedded_cu1=...)` with both optional arguments supplied
-// (used by GainManager).
+// Mirrors
+// `Distribution.hyperedge_cost(hyperedge, server_tree=...,
+// requires_h_embedded_cu1=...)` with both optional arguments supplied (used
+// by GainManager).
 inline int hyperedge_cost_with_tree(const HypergraphCircuit& dist_circ,
                                     const Hyperedge& hyperedge,
                                     const Placement& placement,
@@ -137,11 +138,11 @@ struct Distribution {
   HypergraphCircuit circuit;
   Placement placement;
   Graph server_graph;
-  std::map<int, std::vector<int>> server_qubits;
+  std::map<int, std::vector<int>> server_qubits = {};
   // Mirrors `NISQNetwork.server_ebit_mem` (server id -> communication
   // capacity). `-1` means unbounded (the `NISQNetwork` default). Populated by
   // the bindings; consumed by `to_pytket_circuit` for `satisfy_bound`.
-  std::map<int, int> server_ebit_mem;
+  std::map<int, int> server_ebit_mem = {};
 
   // Mirrors `ServerNetwork.get_server_list()`. Order is irrelevant to
   // `to_pytket_circuit` (only per-server lists are iterated there), so the
